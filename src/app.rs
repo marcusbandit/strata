@@ -377,7 +377,7 @@ impl App {
     }
 
     /// The nickname the user set for a device, if any.
-    fn nickname(&self, dev: &Dev) -> Option<String> {
+    pub fn nickname(&self, dev: &Dev) -> Option<String> {
         Self::alias_key(dev).and_then(|k| self.config.alias(&k)).and_then(|a| a.nickname.clone())
     }
 

@@ -16,6 +16,17 @@ pub enum Health {
     Unknown(String),
 }
 
+impl Health {
+    /// A stable, lowercase word for output: `ok`, `failing`, or `unknown`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Health::Ok => "ok",
+            Health::Failing => "failing",
+            Health::Unknown(_) => "unknown",
+        }
+    }
+}
+
 /// One block device node: a disk, partition, or nested mapping (crypt/lvm).
 ///
 /// Mirrors a single `lsblk` entry plus a couple of enriched fields (`health`,

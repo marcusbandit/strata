@@ -1,5 +1,6 @@
 mod app;
 mod format;
+mod json;
 mod model;
 mod naming;
 mod plain;
@@ -28,7 +29,10 @@ fn main() -> Result<()> {
 
     let app = App::load()?;
 
-    if args.iter().any(|a| a == "--agent") {
+    if args.iter().any(|a| a == "--json") {
+        // Structured output for scripts and agents.
+        json::print(&app);
+    } else if args.iter().any(|a| a == "--agent") {
         // Machine-readable: never colored, names tagged nick/label/dev in text.
         plain::print(&app, &plain::Opts::agent());
     } else if args.iter().any(|a| a == "-p" || a == "--plain") {
@@ -109,11 +113,13 @@ fn print_usage() {
          \x20 strata                    launch the interactive overview (TUI)\n\
          \x20 strata --plain            print a static, colored overview and exit\n\
          \x20 strata --agent            static overview for LLM agents (plain text, tagged)\n\
+         \x20 strata --json             structured JSON of the whole overview\n\
          \x20 strata name <sel> <name>  give a disk/partition a nickname\n\
          \n\
          OPTIONS:\n\
          \x20 -p, --plain      non-interactive overview (colored on a terminal, bare when piped)\n\
          \x20     --agent      non-interactive overview for agents: no color; names tagged nick/label/dev\n\
+         \x20     --json       structured JSON (raw bytes + human sizes + computed facts)\n\
          \x20 -h, --help       show this help\n\
          \x20 -V, --version    show version\n\
          \n\
