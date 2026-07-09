@@ -262,61 +262,91 @@ fn draw_tree(f: &mut Frame, area: Rect, app: &App) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
-/// The header line for a physical disk.
-fn disk_line(app: &App, dev: &Dev, marker: &str) -> Line<'static> {
-    let mut spans = vec![
-        Span::styled(marker.to_string(), Style::default().fg(MUTED)),
-        Span::styled(format::medium_glyph(dev.medium()).to_string(), Style::default().fg(ACCENT)),
-        Span::raw(" "),
-        Span::styled(app.display_name(dev), Style::default().fg(HEADER).add_modifier(Modifier::BOLD)),
-    ];
-    if let Some(model) = &dev.model {
-        spans.push(Span::styled(format!("  {}", truncate(model, 22)), Style::default().fg(MUTED)));
-    }
-    spans.push(Span::styled(format!("  {}", format::human_bytes(dev.size)), Style::default().fg(Color::Gray)));
-    spans.push(Span::styled(format!("  {}", format::medium_tag(dev.medium())), Style::default().fg(MUTED)));
-    if let Some(t) = dev.temp_c {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(format!("{t:.0}°C"), Style::default().fg(format::temp_color(t))));
-    }
-    spans.push(Span::raw(" "));
-    spans.push(health_dot(dev.health.as_ref()));
-    Line::from(spans)
+// Fixed column widths, so every row lines up into a scannable grid. Disk and
+// partition rows share the same 4-column prefix and 16-wide name column, so
+// their names align; from there each row type has its own aligned columns.
+const NAME_W: usize = 16;
+const MODEL_W: usize = 20;
+const FS_W: usize = 6;
+const BAR_W: usize = 12;
+
+fn fg(color: Color) -> Style {
+    Style::default().fg(color)
 }
 
-/// A line for a partition / filesystem under a disk. Indent scales with tree
-/// depth, so a nested device (a LUKS or LVM mapping) sits under its parent.
+/// Truncate (with an ellipsis) or right-pad `s` to exactly `w` display columns.
+fn fit(s: &str, w: usize) -> String {
+    let n = s.chars().count();
+    if n == w {
+        s.to_string()
+    } else if n < w {
+        format!("{s}{}", " ".repeat(w - n))
+    } else {
+        let kept: String = s.chars().take(w.saturating_sub(1)).collect();
+        format!("{kept}…")
+    }
+}
+
+/// The header line for a physical disk: `▾  disk  MODEL  SIZE  tag  temp  ●`.
+fn disk_line(app: &App, dev: &Dev, marker: &str) -> Line<'static> {
+    // Prefix is 4 columns (marker "▾ " + glyph + space), matching part rows.
+    let (temp_txt, temp_color) = match dev.temp_c {
+        Some(t) => (format!("{t:.0}°C"), format::temp_color(t)),
+        None => (String::new(), MUTED),
+    };
+    Line::from(vec![
+        Span::styled(marker.to_string(), fg(MUTED)),
+        Span::styled(format!("{} ", format::medium_glyph(dev.medium())), fg(ACCENT)),
+        Span::styled(fit(&app.display_name(dev), NAME_W), Style::default().fg(HEADER).add_modifier(Modifier::BOLD)),
+        Span::styled(fit(dev.model.as_deref().unwrap_or("-"), MODEL_W), fg(MUTED)),
+        Span::styled(format!("{:>6}", format::human_bytes(dev.size)), fg(Color::Gray)),
+        Span::styled(format!("  {}", fit(format::medium_tag(dev.medium()), 4)), fg(MUTED)),
+        Span::styled(format!("  {temp_txt:>5}"), fg(temp_color)),
+        Span::raw("  "),
+        health_dot(dev.health.as_ref()),
+    ])
+}
+
+/// A filesystem row: `● NAME  fs  ██████░░░░  NN%   used / size`, with the bar,
+/// percentage, and used/size columns aligned across every partition. Indent
+/// scales with tree depth (for nested LUKS/LVM devices) but is absorbed into the
+/// name column so the columns after it stay put.
 fn part_line(app: &App, dev: &Dev, depth: usize) -> Line<'static> {
-    let mut spans = vec![Span::raw("   ".repeat(depth.max(1)))];
-    // Status dot: filled + usage-colored when mounted, hollow + dim when not.
+    let extra = 2 * depth.saturating_sub(1);
+    let name_w = NAME_W.saturating_sub(extra);
+
+    let mut spans = vec![Span::raw(" ".repeat(2 + extra))];
     if dev.is_mounted() {
         let color = dev.used_fraction().map(format::usage_color).unwrap_or(ACCENT);
-        spans.push(Span::styled("● ", Style::default().fg(color)));
+        spans.push(Span::styled("● ", fg(color)));
     } else {
-        spans.push(Span::styled("○ ", Style::default().fg(MUTED)));
-    }
-    spans.push(Span::styled(app.display_name(dev), Style::default().fg(HEADER)));
-    if let Some(fs) = &dev.fstype {
-        spans.push(Span::styled(format!("  {fs}"), Style::default().fg(MUTED)));
+        spans.push(Span::styled("○ ", fg(MUTED)));
     }
 
-    if dev.is_mounted() {
-        if let Some(frac) = dev.used_fraction() {
-            spans.push(Span::raw("  "));
-            spans.extend(bar_spans(frac, 10));
-            spans.push(Span::styled(format!(" {:>3.0}%", frac * 100.0), Style::default().fg(format::usage_color(frac))));
+    let name_style = if dev.is_mounted() { fg(HEADER) } else { fg(MUTED) };
+    spans.push(Span::styled(fit(&app.display_name(dev), name_w), name_style));
+    spans.push(Span::styled(fit(dev.fstype.as_deref().unwrap_or("-"), FS_W), fg(MUTED)));
+    spans.push(Span::raw(" "));
+
+    match (dev.is_mounted(), dev.used_fraction()) {
+        (true, Some(frac)) => {
+            spans.extend(bar_spans(frac, BAR_W));
+            spans.push(Span::styled(format!(" {:>3.0}%", frac * 100.0), fg(format::usage_color(frac))));
+            let usage = match (dev.fsused, dev.fssize) {
+                (Some(u), Some(s)) => format!("  {:>5} / {:>6}", format::human_bytes(u), format::human_bytes(s)),
+                _ => String::new(),
+            };
+            spans.push(Span::styled(usage, fg(MUTED)));
         }
-        if let (Some(used), Some(size)) = (dev.fsused, dev.fssize) {
-            spans.push(Span::styled(
-                format!("  {} / {}", format::human_bytes(used), format::human_bytes(size)),
-                Style::default().fg(MUTED),
-            ));
+        (true, None) => {
+            spans.push(Span::styled(" ".repeat(BAR_W), fg(MUTED)));
+            spans.push(Span::styled("    ?  mounted", fg(MUTED)));
         }
-    } else {
-        spans.push(Span::styled(
-            format!("  {}  not mounted", format::human_bytes(dev.size)),
-            Style::default().fg(MUTED),
-        ));
+        (false, _) => {
+            // Keep the size in the same column as mounted rows' size.
+            spans.push(Span::styled(" ".repeat(BAR_W), fg(MUTED)));
+            spans.push(Span::styled(format!("      {:>6}  not mounted", format::human_bytes(dev.size)), fg(MUTED)));
+        }
     }
     Line::from(spans)
 }
@@ -764,5 +794,17 @@ mod tests {
         assert!(text.contains("WD_BLACK"), "drive model");
         assert!(text.contains("btrfs"), "filesystem shown");
         assert!(text.contains('█'), "a usage bar is drawn");
+    }
+
+    /// Render the real machine to a snapshot for eyeballing alignment. Ignored
+    /// so it never runs in the normal suite:
+    ///   cargo test render_real_system -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn render_real_system() {
+        let app = App::load().unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        eprintln!("\n{}", term.backend());
     }
 }
