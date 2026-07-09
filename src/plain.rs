@@ -195,11 +195,12 @@ fn part_lines(app: &App, opts: &Opts, dev: &Dev, depth: usize, out: &mut String)
     }
 }
 
-/// A `filled/empty` usage bar (`████░░░░`), the filled run colored by usage.
+/// A `filled/empty` usage bar (`████▌░░░`), the filled run colored by usage and
+/// ending in an eighth-block partial for sub-cell precision.
 fn bar(opts: &Opts, frac: f64, width: usize) -> String {
-    let fill = format::bar_fill(frac, width);
-    let filled = paint(opts, &"█".repeat(fill), format::usage_color(frac), false);
-    let empty = paint(opts, &"░".repeat(width - fill), MUTED, false);
+    let (filled, empty) = format::bar_parts(frac, width);
+    let filled = paint(opts, &filled, format::usage_color(frac), false);
+    let empty = paint(opts, &empty, MUTED, false);
     format!("{filled}{empty}")
 }
 

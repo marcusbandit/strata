@@ -37,6 +37,31 @@ pub enum Mode {
     Rename(RenameState),
     Label(LabelState),
     Drill(DrillState),
+    Mount(MountState),
+}
+
+/// Whether a [`MountState`] is about to mount or unmount its device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountAction {
+    Mount,
+    Unmount,
+}
+
+/// Mount/unmount flow. Mounting is armed immediately (it is safe); unmounting
+/// waits for an explicit confirmation first. The actual command runs from the
+/// event loop so it can escalate privileges on the real terminal.
+pub struct MountState {
+    pub device_path: String,
+    /// Display name of the filesystem, for the prompt.
+    pub name: String,
+    /// Where it is mounted (for unmount) or `None` (for mount).
+    pub mountpoint: Option<String>,
+    pub action: MountAction,
+    /// Set once the operation is armed; the event loop then runs it. Mounting
+    /// arms on entry; unmounting arms only after the user confirms.
+    pub confirmed: bool,
+    /// Result of the attempt: `Ok(msg)` / `Err(msg)`, or `None` while pending.
+    pub outcome: Option<Result<String, String>>,
 }
 
 /// Nickname editor for the selected device.
@@ -432,6 +457,37 @@ impl App {
             }
         }
         self.mode = Mode::Overview;
+    }
+
+    // ----- mount / unmount flow -----
+
+    /// Begin mounting or unmounting the selected filesystem. A mounted device is
+    /// unmounted (behind a confirmation); an unmounted one with a filesystem is
+    /// mounted straight away. Refuses to unmount the system root `/`.
+    pub fn begin_mount(&mut self) {
+        let Some(dev) = self.selected_dev().cloned() else {
+            return;
+        };
+        let mounted = dev.is_mounted();
+        if !mounted && dev.fstype.is_none() {
+            self.status = Some("nothing to mount here (no filesystem)".into());
+            return;
+        }
+        if mounted && dev.primary_mount() == Some("/") {
+            self.status = Some("refusing to unmount the system root /".into());
+            return;
+        }
+        let action = if mounted { MountAction::Unmount } else { MountAction::Mount };
+        let (name, _) = self.partition_label(&dev);
+        self.mode = Mode::Mount(MountState {
+            device_path: dev.path.clone(),
+            name,
+            mountpoint: dev.primary_mount().map(str::to_string),
+            action,
+            // Mounting is safe, so arm it now; unmounting waits for a yes.
+            confirmed: action == MountAction::Mount,
+            outcome: None,
+        });
     }
 
     // ----- real-label flow -----

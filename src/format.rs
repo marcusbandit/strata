@@ -58,24 +58,41 @@ pub fn fit(s: &str, w: usize) -> String {
     }
 }
 
-/// Number of filled cells for a usage bar of `width` cells at `frac` (0.0-1.0).
+/// Render a `width`-cell usage bar at `frac` (0.0-1.0) using eighth-block
+/// characters, so the bar tracks the real percentage in 8 sub-steps per cell
+/// instead of jumping a whole cell at a time. Returns `(filled, empty)`: the
+/// filled run (ending in a partial block when `frac` lands mid-cell) for the
+/// caller to paint in the usage color, and the `░` remainder to paint muted.
 ///
-/// Rounds to the nearest cell but never claims "empty" for a non-zero fraction
-/// or "full" for anything under 100%, so a nearly-full disk always shows at
-/// least one gap and a barely-used one always shows at least one tick.
-pub fn bar_fill(frac: f64, width: usize) -> usize {
+/// Like a whole-cell bar it never lies at the edges: a non-zero fraction always
+/// shows at least one-eighth, and anything under 100% always leaves at least
+/// one-eighth unfilled, so "barely used" and "nearly full" never round to the
+/// empty/full extremes.
+pub fn bar_parts(frac: f64, width: usize) -> (String, String) {
     if width == 0 {
-        return 0;
+        return (String::new(), String::new());
     }
     let frac = frac.clamp(0.0, 1.0);
-    let raw = (frac * width as f64).round() as usize;
-    if frac > 0.0 && raw == 0 {
-        1
-    } else if frac < 1.0 && raw >= width {
-        width - 1
-    } else {
-        raw.min(width)
+    let total = width * 8;
+    let mut eighths = (frac * total as f64).round() as usize;
+    if frac > 0.0 && eighths == 0 {
+        eighths = 1;
     }
+    if frac < 1.0 && eighths >= total {
+        eighths = total - 1;
+    }
+    let full = eighths / 8;
+    let rem = eighths % 8;
+    // Left-fill blocks from 1/8 (▏) to 7/8 (▉) of a cell; 8/8 is a full █.
+    const PARTIAL: [char; 7] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉'];
+    let mut filled = "█".repeat(full);
+    let empty_cells = if rem > 0 {
+        filled.push(PARTIAL[rem - 1]);
+        width - full - 1
+    } else {
+        width - full
+    };
+    (filled, "░".repeat(empty_cells))
 }
 
 /// Color a usage fraction: calm below 70%, warning by 85%, alarm above.
@@ -164,16 +181,43 @@ mod tests {
     }
 
     #[test]
-    fn bar_fill_never_lies_at_the_edges() {
-        assert_eq!(bar_fill(0.0, 10), 0);
-        assert_eq!(bar_fill(1.0, 10), 10);
-        // A tiny fraction still shows one tick, not zero.
-        assert_eq!(bar_fill(0.01, 10), 1);
-        // 99% shows a gap, not a full bar.
-        assert_eq!(bar_fill(0.99, 10), 9);
-        assert_eq!(bar_fill(0.5, 10), 5);
-        assert_eq!(bar_fill(0.85, 20), 17);
-        assert_eq!(bar_fill(0.42, 0), 0);
+    fn bar_parts_clean_at_the_extremes() {
+        assert_eq!(bar_parts(0.0, 10), (String::new(), "░".repeat(10)));
+        assert_eq!(bar_parts(1.0, 10), ("█".repeat(10), String::new()));
+        // Exactly half a 10-cell bar is five whole blocks, no partial.
+        assert_eq!(bar_parts(0.5, 10).0, "█".repeat(5));
+        assert_eq!(bar_parts(0.42, 0), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn bar_parts_fills_width_and_never_lies() {
+        for &w in &[1usize, 5, 10, 16] {
+            for pct in 0..=100 {
+                let frac = pct as f64 / 100.0;
+                let (filled, empty) = bar_parts(frac, w);
+                // The two runs together always occupy exactly `width` cells.
+                assert_eq!(filled.chars().count() + empty.chars().count(), w, "w={w} pct={pct}");
+                if frac > 0.0 {
+                    assert!(!filled.is_empty(), "non-zero shows some fill: w={w} pct={pct}");
+                }
+                if frac < 1.0 {
+                    // Under 100% always leaves an eighth: either a visible gap or
+                    // a partial (not fully solid) last block.
+                    let solid = empty.is_empty() && filled.chars().last() == Some('█');
+                    assert!(!solid, "under 100% never reads as full: w={w} pct={pct}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bar_parts_uses_sub_cell_steps() {
+        // 33% of a 10-cell bar is 3.3 cells: three solid blocks plus a partial,
+        // where a whole-cell bar would have shown a flat three.
+        let (filled, _) = bar_parts(0.33, 10);
+        assert_eq!(filled.chars().count(), 4);
+        assert!(filled.starts_with("███"));
+        assert_ne!(filled.chars().last(), Some('█'), "last cell is a partial block");
     }
 
     #[test]

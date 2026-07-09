@@ -5,7 +5,7 @@
 //! master-detail: a drive tree on the left, a detail panel on the right that
 //! carries the depth so the overview itself stays uncluttered.
 
-use crate::app::{App, DrillState, LabelState, Mode, NameKind, RenameState};
+use crate::app::{App, DrillState, LabelState, Mode, MountAction, MountState, NameKind, RenameState};
 use crate::format::{self, fit, ACCENT, HEADER, MOUNT_W, MUTED, NAME_W, NICK};
 use crate::model::{Dev, Health};
 use crate::naming;
@@ -91,9 +91,10 @@ fn event_loop(term: &mut Term, app: &mut App) -> anyhow::Result<()> {
                 }
             }
         }
-        // A confirmed label apply needs the terminal (sudo prompts on it), so it
-        // runs here in the loop rather than inside a plain App method.
+        // A confirmed label apply / mount needs the terminal (sudo prompts on
+        // it), so these run here in the loop rather than inside a plain App method.
         maybe_apply_label(term, app);
+        maybe_apply_mount(term, app);
         app.poll_drill();
         // Auto-refresh only from the calm overview, so it never yanks the tree
         // out from under a rename, a label confirm, a drill scan, or help.
@@ -119,7 +120,31 @@ fn handle_key(app: &mut App, code: KeyCode) {
         Mode::Help => app.mode = Mode::Overview,
         Mode::Rename(_) => handle_rename(app, code),
         Mode::Label(_) => handle_label(app, code),
+        Mode::Mount(_) => handle_mount(app, code),
         Mode::Drill(_) => handle_drill(app, code),
+    }
+}
+
+fn handle_mount(app: &mut App, code: KeyCode) {
+    let (has_outcome, confirmed) = match &app.mode {
+        Mode::Mount(s) => (s.outcome.is_some(), s.confirmed),
+        _ => return,
+    };
+    if has_outcome {
+        // Result shown: any key closes and re-reads so the new mount state shows.
+        app.refresh();
+    } else if confirmed {
+        // Armed and running (a mount); wait for the event loop's outcome.
+    } else {
+        // Unmount confirmation: only y proceeds, everything else cancels.
+        match code {
+            KeyCode::Char('y' | 'Y') => {
+                if let Mode::Mount(s) = &mut app.mode {
+                    s.confirmed = true;
+                }
+            }
+            _ => app.mode = Mode::Overview,
+        }
     }
 }
 
@@ -133,6 +158,7 @@ fn handle_overview(app: &mut App, code: KeyCode) {
         KeyCode::Enter | KeyCode::Char(' ' | 'l' | 'h') | KeyCode::Tab => app.toggle_collapse(),
         KeyCode::Char('r') => app.begin_rename(),
         KeyCode::Char('L') => app.begin_label(),
+        KeyCode::Char('m') => app.begin_mount(),
         KeyCode::Char('d') => app.begin_drill(),
         KeyCode::Char('i') => app.toggle_detail(),
         KeyCode::Char('R') => app.refresh(),
@@ -248,6 +274,7 @@ fn draw(f: &mut Frame, app: &App) {
         Mode::Help => draw_help(f, f.area()),
         Mode::Rename(state) => draw_rename(f, f.area(), state),
         Mode::Label(state) => draw_label(f, f.area(), state),
+        Mode::Mount(state) => draw_mount(f, f.area(), state),
         _ => {}
     }
 }
@@ -489,12 +516,13 @@ fn part_line(app: &App, dev: &Dev, depth: usize, verbose: bool) -> Line<'static>
     Line::from(spans)
 }
 
-/// A compact `filled/empty` usage bar as two colored spans.
+/// A compact `filled/empty` usage bar as two colored spans, the filled run
+/// using eighth-block characters for sub-cell precision.
 fn bar_spans(frac: f64, width: usize) -> Vec<Span<'static>> {
-    let fill = format::bar_fill(frac, width);
+    let (filled, empty) = format::bar_parts(frac, width);
     vec![
-        Span::styled("█".repeat(fill), Style::default().fg(format::usage_color(frac))),
-        Span::styled("░".repeat(width - fill), Style::default().fg(MUTED)),
+        Span::styled(filled, Style::default().fg(format::usage_color(frac))),
+        Span::styled(empty, Style::default().fg(MUTED)),
     ]
 }
 
@@ -661,8 +689,9 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         Mode::Drill(_) => " j/k move · enter descend · backspace up · q back",
         Mode::Rename(_) => " type a nickname · enter save · esc cancel",
         Mode::Label(_) => " type a label · enter preview command · esc cancel",
+        Mode::Mount(_) => " y confirm · n / esc cancel",
         Mode::Help => " any key to close",
-        Mode::Overview => " j/k move · enter expand · r name · L label · d drill · i panel · ? help · q quit",
+        Mode::Overview => " j/k move · enter expand · r name · m mount · L label · d drill · i panel · ? help · q quit",
     };
     f.render_widget(Paragraph::new(Line::from(Span::styled(hints, Style::default().fg(MUTED)))), area);
 }
@@ -739,6 +768,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         help_row("g / G", "jump to top / bottom"),
         help_row("enter / space", "expand or collapse a drive"),
         help_row("r", "give the selected disk a nickname"),
+        help_row("m", "mount, or unmount (asks first), the selected filesystem"),
         help_row("L", "set the real on-disk label (applies it, asks for sudo)"),
         help_row("d", "drill into what is using the space"),
         help_row("i", "show/hide the detail panel (more columns)"),
@@ -854,6 +884,71 @@ fn draw_label(f: &mut Frame, area: Rect, state: &LabelState) {
     f.render_widget(Clear, popup);
     f.render_widget(
         Paragraph::new(Text::from(lines)).block(bordered_title(" set real label ")).wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn draw_mount(f: &mut Frame, area: Rect, state: &MountState) {
+    let sage = Color::Rgb(0x7c, 0xb3, 0x9b);
+    let red = Color::Rgb(0xd0, 0x6f, 0x6f);
+    let amber = Color::Rgb(0xd4, 0xb0, 0x6a);
+    let mut lines = Vec::new();
+
+    if let Some(outcome) = &state.outcome {
+        // Result of the attempt.
+        match outcome {
+            Ok(msg) => lines.push(Line::from(Span::styled(
+                format!("done: {msg}"),
+                Style::default().fg(sage).add_modifier(Modifier::BOLD),
+            ))),
+            Err(msg) => lines.push(Line::from(Span::styled(msg.clone(), Style::default().fg(red)))),
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled("any key to close", fg(MUTED))));
+    } else {
+        match state.action {
+            // Unmount: the "are you sure?" the user asked for.
+            MountAction::Unmount => {
+                lines.push(Line::from(vec![
+                    Span::styled("Unmount ", fg(HEADER)),
+                    Span::styled(state.name.clone(), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                    Span::styled(" ?", fg(HEADER)),
+                ]));
+                if let Some(mp) = &state.mountpoint {
+                    lines.push(Line::from(Span::styled(format!("currently mounted at {mp}"), fg(MUTED))));
+                }
+                lines.push(Line::raw(""));
+                lines.push(Line::from(Span::styled(
+                    "Its files stay on disk but become inaccessible until you mount it again.",
+                    Style::default().fg(amber),
+                )));
+                lines.push(Line::raw(""));
+                lines.push(Line::from(vec![
+                    Span::styled("y", Style::default().fg(sage).add_modifier(Modifier::BOLD)),
+                    Span::styled(": yes, unmount     ", fg(MUTED)),
+                    Span::styled("n / esc", fg(HEADER)),
+                    Span::styled(": cancel", fg(MUTED)),
+                ]));
+            }
+            // Mount is armed already; this frame just shows while it runs.
+            MountAction::Mount => {
+                lines.push(Line::from(vec![
+                    Span::styled("Mounting ", fg(HEADER)),
+                    Span::styled(state.name.clone(), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                    Span::styled(" …", fg(MUTED)),
+                ]));
+            }
+        }
+    }
+
+    let title = match state.action {
+        MountAction::Unmount => " unmount ",
+        MountAction::Mount => " mount ",
+    };
+    let popup = centered(area, 66, 40);
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).block(bordered_title(title)).wrap(Wrap { trim: false }),
         popup,
     );
 }
@@ -1027,6 +1122,104 @@ fn build_script(plan: &naming::LabelPlan, mp: Option<&str>) -> String {
 /// Single-quote a string for safe use inside a `sh -c` command.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+// ===== mount / unmount (privilege escalation) ================================
+
+/// If the user armed a mount/unmount, run it (with terminal access for sudo)
+/// and record the outcome on the mount state.
+fn maybe_apply_mount(term: &mut Term, app: &mut App) {
+    let (path, mp, action) = match &app.mode {
+        Mode::Mount(s) if s.confirmed && s.outcome.is_none() => {
+            (s.device_path.clone(), s.mountpoint.clone(), s.action)
+        }
+        _ => return,
+    };
+    let outcome = match action {
+        MountAction::Mount => apply_mount(term, &path),
+        MountAction::Unmount => apply_unmount(term, &path, mp.as_deref()),
+    };
+    if let Mode::Mount(s) = &mut app.mode {
+        s.outcome = Some(outcome);
+    }
+}
+
+/// Mount a device, preferring the no-root desktop path and only then escalating:
+/// 1. `udisksctl mount` (polkit; auto-picks a mountpoint under /run/media),
+/// 2. plain `mount <dev>` (honors fstab) directly, then sudo, then pkexec.
+fn apply_mount(term: &mut Term, path: &str) -> Result<String, String> {
+    let (ok, out, _) = run_out("udisksctl", &["mount", "-b", path]);
+    if ok {
+        // udisksctl prints e.g. "Mounted /dev/sdX1 at /run/media/user/Label."
+        let at = out.trim().trim_end_matches('.').rsplit(" at ").next().unwrap_or("").trim();
+        return Ok(if at.is_empty() { "mounted".into() } else { format!("mounted at {at}") });
+    }
+    let cmd = format!("mount {}", shell_quote(path));
+    let (direct, first_err) = run_captured("sh", &["-c", &cmd]);
+    if direct {
+        return Ok("mounted".into());
+    }
+    if let Some(true) = run_suspended(
+        term,
+        "sudo",
+        &["sh", "-c", &cmd],
+        "Mounting needs root. Authenticate for sudo below:",
+    ) {
+        return Ok("mounted (via sudo)".into());
+    }
+    if run_captured("pkexec", &["sh", "-c", &cmd]).0 {
+        return Ok("mounted (via pkexec)".into());
+    }
+    Err(format!(
+        "could not mount it ({}). Try:  udisksctl mount -b {path}",
+        one_line(&first_err, "permission denied")
+    ))
+}
+
+/// Unmount a device, preferring the no-root desktop path and only then
+/// escalating `umount` on its mountpoint (or the device).
+fn apply_unmount(term: &mut Term, path: &str, mp: Option<&str>) -> Result<String, String> {
+    if run_out("udisksctl", &["unmount", "-b", path]).0 {
+        return Ok("unmounted".into());
+    }
+    let target = mp.unwrap_or(path);
+    let cmd = format!("umount {}", shell_quote(target));
+    let (direct, first_err) = run_captured("sh", &["-c", &cmd]);
+    if direct {
+        return Ok("unmounted".into());
+    }
+    if let Some(true) = run_suspended(
+        term,
+        "sudo",
+        &["sh", "-c", &cmd],
+        "Unmounting needs root. Authenticate for sudo below:",
+    ) {
+        return Ok("unmounted (via sudo)".into());
+    }
+    if run_captured("pkexec", &["sh", "-c", &cmd]).0 {
+        return Ok("unmounted (via pkexec)".into());
+    }
+    Err(format!(
+        "could not unmount it ({}). Something may still be using it.",
+        one_line(&first_err, "target is busy")
+    ))
+}
+
+/// Run a command, capturing success plus stdout and stderr.
+fn run_out(program: &str, args: &[&str]) -> (bool, String, String) {
+    match std::process::Command::new(program).args(args).output() {
+        Ok(o) => (
+            o.status.success(),
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+            String::from_utf8_lossy(&o.stderr).into_owned(),
+        ),
+        Err(e) => (false, String::new(), e.to_string()),
+    }
+}
+
+/// The first non-empty, trimmed line of `text`, or `fallback` when there is none.
+fn one_line<'a>(text: &'a str, fallback: &'a str) -> &'a str {
+    text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or(fallback)
 }
 
 #[cfg(test)]
