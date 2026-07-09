@@ -197,12 +197,27 @@ fn handle_label(app: &mut App, code: KeyCode) {
     match phase {
         // Result shown: any key closes and re-reads so the new label appears.
         2 => app.refresh(),
-        // Preview: apply, copy the command, or cancel.
+        // Preview: apply, scan dependencies, copy the command, or cancel.
         1 => match code {
             KeyCode::Esc => app.mode = Mode::Overview,
             KeyCode::Enter => {
                 if let Mode::Label(s) = &mut app.mode {
                     s.apply = true; // the event loop runs the escalated apply
+                }
+            }
+            // Scan the system for what still resolves this volume by its current
+            // label, so the user sees what a relabel would break.
+            KeyCode::Char('s') => {
+                let old = match &app.mode {
+                    Mode::Label(s) => s.old_label.clone(),
+                    _ => None,
+                };
+                let refs = match old.filter(|l| !l.is_empty()) {
+                    Some(old) => naming::scan_label_dependencies(&old),
+                    None => Vec::new(), // no prior label -> nothing can reference it
+                };
+                if let Mode::Label(s) = &mut app.mode {
+                    s.deps = Some(refs);
                 }
             }
             KeyCode::Char('c') => {
@@ -857,12 +872,54 @@ fn draw_label(f: &mut Frame, area: Rect, state: &LabelState) {
         }
         lines.push(Line::from(Span::styled(plan.note.clone(), fg(MUTED))));
         lines.push(Line::raw(""));
+
+        // Dependency-scan block: what a relabel would break, and whether the
+        // user has looked yet.
+        let old = state.old_label.as_deref().unwrap_or("");
+        match &state.deps {
+            None => {
+                lines.push(Line::from(Span::styled(
+                    format!("\u{26a0} relabeling can break things that resolve this volume by \"{old}\"."),
+                    Style::default().fg(Color::Rgb(0xd4, 0xb0, 0x6a)),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "press s to scan fstab, crypttab, systemd, and boot config for it first",
+                    Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+                )));
+            }
+            Some(refs) if refs.is_empty() => {
+                lines.push(Line::from(Span::styled(
+                    format!("\u{2713} nothing references \"{old}\" in fstab, crypttab, systemd, or boot config."),
+                    Style::default().fg(Color::Rgb(0x7c, 0xb3, 0x9b)),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "safe to relabel here (scripts elsewhere are not covered).",
+                    fg(MUTED),
+                )));
+            }
+            Some(refs) => {
+                lines.push(Line::from(Span::styled(
+                    format!("\u{26a0} {} reference(s) to \"{old}\" would break; fix these after relabeling:", refs.len()),
+                    Style::default().fg(Color::Rgb(0xd0, 0x6f, 0x6f)),
+                )));
+                for r in refs {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {}  ", r.source), fg(MUTED)),
+                        Span::styled(r.text.clone(), fg(HEADER)),
+                    ]));
+                }
+            }
+        }
+        lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             "strata tries directly, then sudo (prompts here), then a graphical popup.",
             Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
         )));
         lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled("enter: apply · c: copy command · esc: cancel", fg(MUTED))));
+        lines.push(Line::from(Span::styled(
+            "enter: apply · s: scan for what uses the old label · c: copy · esc: cancel",
+            fg(MUTED),
+        )));
     } else {
         // Phase 1: type the label.
         lines.push(Line::from(vec![
@@ -880,7 +937,7 @@ fn draw_label(f: &mut Frame, area: Rect, state: &LabelState) {
         lines.push(Line::from(Span::styled("enter: preview · esc: cancel", fg(MUTED))));
     }
 
-    let popup = centered(area, 74, 55);
+    let popup = centered(area, 80, 80);
     f.render_widget(Clear, popup);
     f.render_widget(
         Paragraph::new(Text::from(lines)).block(bordered_title(" set real label ")).wrap(Wrap { trim: false }),
@@ -1300,6 +1357,8 @@ mod tests {
             fstype: "btrfs".into(),
             mountpoint: Some("/".into()),
             input: "Root".into(),
+            old_label: None,
+            deps: None,
             plan: Some(plan),
             apply: false,
             outcome: None,

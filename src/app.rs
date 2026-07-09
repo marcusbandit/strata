@@ -80,6 +80,12 @@ pub struct LabelState {
     pub fstype: String,
     pub mountpoint: Option<String>,
     pub input: String,
+    /// The device's current on-disk label at the start of the flow. The
+    /// dependency scan looks for what references *this* before it is overwritten.
+    pub old_label: Option<String>,
+    /// Result of the "what still references the old label?" scan (`None` until
+    /// the user runs it; `Some(empty)` means it ran and found nothing).
+    pub deps: Option<Vec<naming::LabelRef>>,
     /// The planned relabel command, filled in once the user previews it.
     pub plan: Option<naming::LabelPlan>,
     /// Set when the user confirms; the event loop consumes it to run the apply
@@ -510,6 +516,8 @@ impl App {
             fstype,
             mountpoint: dev.primary_mount().map(str::to_string),
             input: dev.label.clone().unwrap_or_default(),
+            old_label: dev.label.clone(),
+            deps: None,
             plan: None,
             apply: false,
             outcome: None,

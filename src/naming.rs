@@ -213,9 +213,139 @@ pub fn run_label(plan: &LabelPlan) -> Result<()> {
     Ok(())
 }
 
+// ===== Part C: relabel dependency scan ======================================
+//
+// Changing a filesystem's on-disk label silently breaks anything that resolves
+// the volume *by* that label: `LABEL=<old>` lines in fstab/crypttab/the kernel
+// cmdline, and `/dev/disk/by-label/<old>` paths in systemd units or boot
+// entries (that symlink is renamed the moment the label changes). This scan
+// surfaces those references before the relabel so the user can fix them.
+
+/// One place that refers to a filesystem label, found by [`scan_label_dependencies`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelRef {
+    /// Where it was found, as `path:line`.
+    pub source: String,
+    /// The referring line, trimmed.
+    pub text: String,
+}
+
+/// System config files worth checking for a `LABEL=` / `by-label/` reference.
+/// All are world-readable, so the scan needs no root. The directory globs pick
+/// up systemd-boot entries and hand-written systemd mount units.
+fn dependency_files() -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = ["/etc/fstab", "/etc/crypttab", "/etc/default/grub", "/proc/cmdline"]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    for dir in ["/boot/loader/entries", "/etc/systemd/system"] {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                let keep = p
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| matches!(e, "conf" | "mount" | "automount" | "swap"));
+                if keep {
+                    files.push(p);
+                }
+            }
+        }
+    }
+    files
+}
+
+/// Whether `line` contains `needle` as a whole label token, i.e. not immediately
+/// followed by another label-ish char (so label `data` does not match `database`).
+fn refers(line: &str, needle: &str) -> bool {
+    let mut from = 0;
+    while let Some(pos) = line[from..].find(needle) {
+        let end = from + pos + needle.len();
+        let boundary = line[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '-' || c == '.'));
+        if boundary {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+/// Pure: find every line across `sources` (each `(name, contents)`) that resolves
+/// the volume *by* label `label` and would therefore break if it were relabeled:
+/// the `LABEL=<label>` and `by-label/<label>` forms. Comment/blank lines are
+/// skipped; matching is case-sensitive, as the kernel's by-label paths are.
+pub fn find_label_refs(label: &str, sources: &[(String, String)]) -> Vec<LabelRef> {
+    let mut hits = Vec::new();
+    if label.is_empty() {
+        return hits;
+    }
+    let needles = [format!("LABEL={label}"), format!("by-label/{label}")];
+    for (name, contents) in sources {
+        for (i, line) in contents.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if needles.iter().any(|n| refers(line, n)) {
+                hits.push(LabelRef {
+                    source: format!("{name}:{}", i + 1),
+                    text: trimmed.to_string(),
+                });
+            }
+        }
+    }
+    hits
+}
+
+/// Read the standard config files and scan them for references to `label`.
+/// Best-effort: unreadable files are simply skipped.
+pub fn scan_label_dependencies(label: &str) -> Vec<LabelRef> {
+    let sources: Vec<(String, String)> = dependency_files()
+        .into_iter()
+        .filter_map(|p| std::fs::read_to_string(&p).ok().map(|c| (p.display().to_string(), c)))
+        .collect();
+    find_label_refs(label, &sources)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_label_refs_matches_both_forms() {
+        let fstab = "# a comment LABEL=archive is skipped\n\
+                     LABEL=archive /mnt/archive ext4 defaults 0 0\n\
+                     UUID=abcd /mnt/other ext4 defaults 0 0\n"
+            .to_string();
+        let unit = "What=/dev/disk/by-label/archive\n".to_string();
+        let sources = vec![
+            ("/etc/fstab".to_string(), fstab),
+            ("/etc/systemd/system/mnt-archive.mount".to_string(), unit),
+        ];
+        let refs = find_label_refs("archive", &sources);
+        assert_eq!(refs.len(), 2, "the LABEL= line and the by-label unit");
+        assert_eq!(refs[0].source, "/etc/fstab:2");
+        assert!(refs[0].text.starts_with("LABEL=archive"));
+        assert_eq!(refs[1].source, "/etc/systemd/system/mnt-archive.mount:1");
+    }
+
+    #[test]
+    fn find_label_refs_is_token_exact_and_skips_noise() {
+        let src = vec![(
+            "f".to_string(),
+            "LABEL=archived /x ext4 defaults 0 0\n\
+             # LABEL=archive commented out\n\
+             What=/dev/disk/by-label/archive-2\n"
+                .to_string(),
+        )];
+        // A longer label sharing the prefix, a comment, and an empty label all
+        // find nothing.
+        assert!(find_label_refs("archive", &src).is_empty());
+        assert!(find_label_refs("", &src).is_empty());
+    }
 
     #[test]
     fn config_toml_round_trip() {
