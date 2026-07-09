@@ -40,6 +40,7 @@ pub enum Mode {
     Mount(MountState),
     Search(SearchState),
     Yank(YankState),
+    Note(NoteState),
 }
 
 /// Live tree filter editor: what the user is typing narrows the tree as they go.
@@ -118,6 +119,13 @@ pub struct RenameState {
     /// Alias key (UUID, or a disk's serial) the nickname will be stored under.
     pub key: String,
     /// Human label of what is being renamed, for the prompt.
+    pub target: String,
+    pub input: String,
+}
+
+/// Free-text note editor for the selected device (same alias config as nicknames).
+pub struct NoteState {
+    pub key: String,
     pub target: String,
     pub input: String,
 }
@@ -656,6 +664,66 @@ impl App {
             }
         }
         self.mode = Mode::Overview;
+    }
+
+    /// The free-text note the user attached to a device, if any.
+    pub fn note_of(&self, dev: &Dev) -> Option<String> {
+        Self::alias_key(dev).and_then(|k| self.config.alias(&k)).and_then(|a| a.notes.clone())
+    }
+
+    /// Begin editing the selected device's note (opens the note editor).
+    pub fn begin_note(&mut self) {
+        let Some(dev) = self.selected_dev().cloned() else {
+            return;
+        };
+        let Some(key) = Self::alias_key(&dev) else {
+            self.status = Some("this row has no stable id to note".into());
+            return;
+        };
+        let current = self.note_of(&dev).unwrap_or_default();
+        self.mode = Mode::Note(NoteState {
+            key,
+            target: self.display_name(&dev),
+            input: current,
+        });
+    }
+
+    /// Commit the note currently typed in the note editor to the config.
+    pub fn commit_note(&mut self) {
+        if let Mode::Note(state) = &self.mode {
+            let key = state.key.clone();
+            let trimmed = state.input.trim().to_string();
+            let mut alias = self.config.alias(&key).cloned().unwrap_or_default();
+            alias.notes = if trimmed.is_empty() { None } else { Some(trimmed) };
+            self.config.set(&key, alias);
+            match naming::save(&self.config) {
+                Ok(()) => self.status = Some("note saved".into()),
+                Err(e) => self.status = Some(format!("save failed: {e}")),
+            }
+        }
+        self.mode = Mode::Overview;
+    }
+
+    /// Set (or, with `None`/empty, clear) the note of the device matching
+    /// `selector`, persisting it. Returns a confirmation or an explanatory error.
+    /// The CLI twin of [`set_nickname`](Self::set_nickname).
+    pub fn set_note(&mut self, selector: &str, note: Option<&str>) -> Result<String, String> {
+        let dev = self
+            .find_dev(selector)
+            .cloned()
+            .ok_or_else(|| format!("no disk or partition matches \"{selector}\""))?;
+        let key = Self::alias_key(&dev).ok_or_else(|| {
+            format!("\"{}\" has no stable id (UUID or serial) to attach a note to", dev.name)
+        })?;
+        let clean = note.map(str::trim).filter(|s| !s.is_empty());
+        let mut alias = self.config.alias(&key).cloned().unwrap_or_default();
+        alias.notes = clean.map(str::to_string);
+        self.config.set(&key, alias);
+        naming::save(&self.config).map_err(|e| format!("failed to save config: {e}"))?;
+        Ok(match clean {
+            Some(n) => format!("{} note set to \"{}\"", dev.name, n),
+            None => format!("{} note cleared", dev.name),
+        })
     }
 
     // ----- mount / unmount flow -----

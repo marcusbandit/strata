@@ -6,7 +6,8 @@
 //! carries the depth so the overview itself stays uncluttered.
 
 use crate::app::{
-    App, DrillState, LabelState, Mode, MountAction, MountState, NameKind, RenameState, SortKey,
+    App, DrillState, LabelState, Mode, MountAction, MountState, NameKind, NoteState, RenameState,
+    SortKey,
 };
 use crate::format::{self, fit, ACCENT, HEADER, MOUNT_W, MUTED, NAME_W, NICK};
 use crate::model::{Dev, Health};
@@ -125,6 +126,7 @@ fn handle_key(app: &mut App, code: KeyCode) {
         Mode::Mount(_) => handle_mount(app, code),
         Mode::Search(_) => handle_search(app, code),
         Mode::Yank(_) => handle_yank(app, code),
+        Mode::Note(_) => handle_note(app, code),
         Mode::Drill(_) => handle_drill(app, code),
     }
 }
@@ -243,6 +245,7 @@ fn handle_overview(app: &mut App, code: KeyCode) {
         KeyCode::Char('G') | KeyCode::End => app.select_last(),
         KeyCode::Enter | KeyCode::Char(' ' | 'l' | 'h') | KeyCode::Tab => app.toggle_collapse(),
         KeyCode::Char('r') => app.begin_rename(),
+        KeyCode::Char('N') => app.begin_note(),
         KeyCode::Char('L') => app.begin_label(),
         KeyCode::Char('m') => app.begin_mount(),
         KeyCode::Char('y') => app.begin_yank(),
@@ -267,6 +270,24 @@ fn handle_rename(app: &mut App, code: KeyCode) {
         }
         KeyCode::Char(c) => {
             if let Mode::Rename(state) = &mut app.mode {
+                state.input.push(c);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_note(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Esc => app.mode = Mode::Overview,
+        KeyCode::Enter => app.commit_note(),
+        KeyCode::Backspace => {
+            if let Mode::Note(state) = &mut app.mode {
+                state.input.pop();
+            }
+        }
+        KeyCode::Char(c) => {
+            if let Mode::Note(state) = &mut app.mode {
                 state.input.push(c);
             }
         }
@@ -377,6 +398,7 @@ fn draw(f: &mut Frame, app: &App) {
     match &app.mode {
         Mode::Help => draw_help(f, f.area()),
         Mode::Rename(state) => draw_rename(f, f.area(), state),
+        Mode::Note(state) => draw_note(f, f.area(), state),
         Mode::Label(state) => draw_label(f, f.area(), state),
         Mode::Mount(state) => draw_mount(f, f.area(), state),
         Mode::Yank(state) => draw_yank(f, f.area(), state),
@@ -662,7 +684,7 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
         .title(Span::styled(" details ", Style::default().fg(ACCENT)));
 
     let text = match app.selected_dev() {
-        Some(dev) if dev.is_disk() => detail_disk(dev),
+        Some(dev) if dev.is_disk() => detail_disk(app, dev),
         Some(dev) => detail_part(app, dev),
         None => Text::from("no device selected"),
     };
@@ -676,7 +698,20 @@ fn kv(key: &str, value: String) -> Line<'static> {
     ])
 }
 
-fn detail_disk(dev: &Dev) -> Text<'static> {
+/// Append the user's free-text note for `dev`, if any, as a highlighted block
+/// (styled like a sticky note so it stands apart from the device facts).
+fn push_note(app: &App, dev: &Dev, lines: &mut Vec<Line<'static>>) {
+    if let Some(note) = app.note_of(dev) {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled("note", Style::default().fg(MUTED))));
+        lines.push(Line::from(Span::styled(
+            note,
+            Style::default().fg(Color::Rgb(0xd4, 0xb0, 0x6a)).add_modifier(Modifier::ITALIC),
+        )));
+    }
+}
+
+fn detail_disk(app: &App, dev: &Dev) -> Text<'static> {
     let mut lines = vec![
         Line::from(Span::styled(
             dev.model.clone().unwrap_or_else(|| dev.name.clone()),
@@ -702,6 +737,7 @@ fn detail_disk(dev: &Dev) -> Text<'static> {
     if dev.ro {
         lines.push(kv("read-only", "yes (whole device)".into()));
     }
+    push_note(app, dev, &mut lines);
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         "Press d on a mounted filesystem to see what is using its space.",
@@ -768,13 +804,7 @@ fn detail_part(app: &App, dev: &Dev) -> Text<'static> {
         lines.push(kv("size", format::human_bytes(dev.size)));
     }
 
-    // Nickname + notes, if the user has set an alias.
-    if let Some(alias) = App::alias_key(dev).and_then(|k| app.config.alias(&k).cloned()) {
-        if let Some(notes) = alias.notes {
-            lines.push(Line::raw(""));
-            lines.push(kv("notes", notes));
-        }
-    }
+    push_note(app, dev, &mut lines);
 
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
@@ -819,6 +849,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let hints = match &app.mode {
         Mode::Drill(_) => " j/k move · enter descend · backspace up · q back",
         Mode::Rename(_) => " type a nickname · enter save · esc cancel",
+        Mode::Note(_) => " type a note · enter save · esc cancel",
         Mode::Label(_) => " type a label · enter preview command · esc cancel",
         Mode::Mount(_) => " y confirm · n / esc cancel",
         Mode::Search(_) => " type to filter · enter keep · esc clear",
@@ -906,6 +937,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         help_row("s", "cycle sort: tree, size, used, name"),
         help_row("enter / space", "expand or collapse a drive"),
         help_row("r", "give the selected disk a nickname"),
+        help_row("N", "attach a free-text note to the selected device"),
         help_row("m", "mount, or unmount (asks first), the selected filesystem"),
         help_row("o", "open the mountpoint in your file manager"),
         help_row("y", "copy a fact (path, uuid, mount, label) to the clipboard"),
@@ -955,6 +987,29 @@ fn draw_rename(f: &mut Frame, area: Rect, state: &RenameState) {
     let popup = centered(area, 54, 30);
     f.render_widget(Clear, popup);
     f.render_widget(Paragraph::new(Text::from(lines)).block(bordered_title(" rename ")), popup);
+}
+
+fn draw_note(f: &mut Frame, area: Rect, state: &NoteState) {
+    let lines = vec![
+        Line::from(Span::styled(format!("Note for {}", state.target), Style::default().fg(HEADER))),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("> ", Style::default().fg(ACCENT)),
+            Span::styled(state.input.clone(), Style::default().fg(HEADER)),
+            Span::styled("▏", Style::default().fg(ACCENT)),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "enter save · esc cancel · empty clears  (e.g. \"backup drive, rotate monthly\")",
+            Style::default().fg(MUTED),
+        )),
+    ];
+    let popup = centered(area, 64, 30);
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).block(bordered_title(" note ")).wrap(Wrap { trim: false }),
+        popup,
+    );
 }
 
 fn draw_label(f: &mut Frame, area: Rect, state: &LabelState) {

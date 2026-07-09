@@ -33,6 +33,8 @@ struct DriveJson {
     system: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
     partitions: Vec<PartJson>,
 }
 
@@ -61,6 +63,8 @@ struct PartJson {
     avail_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     use_percent: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     children: Vec<PartJson>,
 }
@@ -96,6 +100,7 @@ fn drive(app: &App, dev: &Dev) -> DriveJson {
         health: dev.health.as_ref().map(|h| h.as_str()).unwrap_or("unknown"),
         system: App::disk_is_system(dev),
         model: dev.model.clone(),
+        note: app.note_of(dev),
         partitions: dev.children.iter().map(|c| part(app, c)).collect(),
     }
 }
@@ -117,6 +122,7 @@ fn part(app: &App, dev: &Dev) -> PartJson {
         used_bytes: dev.fsused,
         avail_bytes: dev.fsavail,
         use_percent: dev.used_fraction().map(|f| (f * 100.0).round() as u32),
+        note: app.note_of(dev),
         children: dev.children.iter().map(|c| part(app, c)).collect(),
     }
 }

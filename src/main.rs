@@ -17,6 +17,10 @@ fn main() -> Result<()> {
     if args.first().map(String::as_str) == Some("name") {
         return run_name(&args[1..]);
     }
+    // `strata note <selector> [text]` attaches a free-text note.
+    if args.first().map(String::as_str) == Some("note") {
+        return run_note(&args[1..]);
+    }
 
     if args.iter().any(|a| a == "-h" || a == "--help") {
         print_usage();
@@ -105,6 +109,41 @@ fn run_name(rest: &[String]) -> Result<()> {
     }
 }
 
+/// Handle `strata note <selector> [text...]` (or `-c`/`--clear`).
+fn run_note(rest: &[String]) -> Result<()> {
+    let mut clear = false;
+    let mut positional: Vec<&str> = Vec::new();
+    for a in rest {
+        match a.as_str() {
+            "-c" | "--clear" => clear = true,
+            other => positional.push(other),
+        }
+    }
+
+    let Some(&selector) = positional.first() else {
+        eprintln!(
+            "usage: strata note <disk|partition|mountpoint> [text]\n\
+             \x20 strata note /mnt/archive \"cold backups, rotate monthly\"   set a note\n\
+             \x20 strata note /mnt/archive --clear                          remove it"
+        );
+        std::process::exit(2);
+    };
+
+    let mut app = App::load()?;
+    let text = positional[1..].join(" ");
+    let value = if clear || text.trim().is_empty() { None } else { Some(text.as_str()) };
+    match app.set_note(selector, value) {
+        Ok(msg) => {
+            println!("{msg}");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("strata: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn print_usage() {
     println!(
         "strata {} - a calmer disk overview\n\
@@ -115,6 +154,7 @@ fn print_usage() {
          \x20 strata --agent            static overview for LLM agents (plain text, tagged)\n\
          \x20 strata --json             structured JSON of the whole overview\n\
          \x20 strata name <sel> <name>  give a disk/partition a nickname\n\
+         \x20 strata note <sel> <text>  attach a free-text note to a disk/partition\n\
          \n\
          OPTIONS:\n\
          \x20 -p, --plain      non-interactive overview (colored on a terminal, bare when piped)\n\
