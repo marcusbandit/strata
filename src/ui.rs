@@ -236,19 +236,18 @@ fn draw_overview(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_tree(f: &mut Frame, area: Rect, app: &App, verbose: bool) {
-    let items: Vec<ListItem> = app
-        .rows
-        .iter()
-        .map(|row| {
-            let dev = app.dev_at(&row.path);
-            let line = match dev {
-                Some(d) if row.is_disk => disk_line(app, d, &app.collapsed_marker(row), verbose),
-                Some(d) => part_line(app, d, row.depth, verbose),
-                None => Line::from("?"),
-            };
-            ListItem::new(line)
-        })
-        .collect();
+    // A non-selectable column header sits at the top so the first column reads
+    // clearly as "the name" and the rest are labelled too.
+    let mut items = vec![column_header(verbose)];
+    items.extend(app.rows.iter().map(|row| {
+        let dev = app.dev_at(&row.path);
+        let line = match dev {
+            Some(d) if row.is_disk => disk_line(app, d, &app.collapsed_marker(row), verbose),
+            Some(d) => part_line(app, d, row.depth, verbose),
+            None => Line::from("?"),
+        };
+        ListItem::new(line)
+    }));
 
     let title = if verbose {
         " drives · i: show detail panel "
@@ -268,9 +267,28 @@ fn draw_tree(f: &mut Frame, area: Rect, app: &App, verbose: bool) {
 
     let mut state = ListState::default();
     if !app.rows.is_empty() {
-        state.select(Some(app.selected));
+        // +1 because the header occupies list index 0 and is never selected.
+        state.select(Some(app.selected + 1));
     }
     f.render_stateful_widget(list, area, &mut state);
+}
+
+/// The dim column-labels row shown above the tree. Its columns line up with the
+/// data rows (both are offset by the same highlight-symbol gutter), so "NAME"
+/// sits over the names and "MOUNT" over the mountpoints.
+fn column_header(verbose: bool) -> ListItem<'static> {
+    let mut s = String::from("    "); // indent (2) + status-dot slot (2)
+    s.push_str(&fit("NAME", NAME_W + 1));
+    s.push_str(&fit("MOUNT", MOUNT_W + 1));
+    if verbose {
+        s.push_str(&fit("TYPE", 7));
+        s.push_str(&fit("DEVICE", 13));
+    }
+    s.push_str("USAGE");
+    ListItem::new(Line::from(Span::styled(
+        s,
+        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+    )))
 }
 
 // Fixed column widths, so every row lines up into a scannable grid. Disk and
@@ -297,9 +315,27 @@ fn fit(s: &str, w: usize) -> String {
     }
 }
 
-/// The header line for a physical disk. Leads with the disk's name and a
-/// `system` badge when it holds `/`, so the OS drive is obvious at a glance.
-/// The long model string only appears in verbose (detail-panel-hidden) mode.
+/// Sum the used bytes across a disk's mounted filesystems. Returns the total
+/// used and whether any usage was actually known (all-unmounted disks are not).
+fn disk_used(dev: &Dev) -> (u64, bool) {
+    fn rec(d: &Dev, used: &mut u64, known: &mut bool) {
+        if let Some(u) = d.fsused {
+            *used += u;
+            *known = true;
+        }
+        for c in &d.children {
+            rec(c, used, known);
+        }
+    }
+    let (mut used, mut known) = (0u64, false);
+    rec(dev, &mut used, &mut known);
+    (used, known)
+}
+
+/// The header line for a physical disk. Leads with the disk's name, then a
+/// `system` badge when it holds `/`, temperature and health, and an aggregate
+/// usage bar for the whole drive (used across all its filesystems / total size),
+/// aligned with the partition bars below it. Model appears only in verbose mode.
 fn disk_line(app: &App, dev: &Dev, marker: &str, verbose: bool) -> Line<'static> {
     let (temp_txt, temp_color) = match dev.temp_c {
         Some(t) => (format!("{t:.0}°C"), format::temp_color(t)),
@@ -309,22 +345,48 @@ fn disk_line(app: &App, dev: &Dev, marker: &str, verbose: bool) -> Line<'static>
         Span::styled(marker.to_string(), fg(MUTED)),
         Span::styled(format!("{} ", format::medium_glyph(dev.medium())), fg(ACCENT)),
         Span::styled(fit(&app.disk_display(dev), NAME_W), Style::default().fg(HEADER).add_modifier(Modifier::BOLD)),
-        Span::raw(" "),
     ];
     if verbose {
-        spans.push(Span::styled(fit(dev.model.as_deref().unwrap_or("-"), MODEL_W), fg(MUTED)));
         spans.push(Span::raw(" "));
+        spans.push(Span::styled(fit(dev.model.as_deref().unwrap_or("-"), MODEL_W), fg(MUTED)));
     }
+
+    // Middle block: temp, health, and the system badge, padded to the same
+    // width as a partition's mount column so the usage bar lines up with theirs.
+    let mut mid: Vec<Span<'static>> = Vec::new();
+    let mut mid_w = 0usize;
+    let temp_disp = if temp_txt.is_empty() { "    ".to_string() } else { format!("{temp_txt:>4}") };
+    mid.push(Span::raw(" "));
+    mid.push(Span::styled(temp_disp, fg(temp_color)));
+    mid.push(Span::raw(" "));
+    mid.push(health_dot(dev.health.as_ref()));
+    mid_w += 1 + 4 + 1 + 1;
     if App::disk_is_system(dev) {
-        spans.push(Span::styled(fit("system", 8), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
-    } else {
-        spans.push(Span::raw(" ".repeat(8)));
+        mid.push(Span::styled("  system", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
+        mid_w += 8;
     }
-    spans.push(Span::styled(fit(format::medium_tag(dev.medium()), 5), fg(MUTED)));
-    spans.push(Span::styled(format!("{:>6}", format::human_bytes(dev.size)), fg(Color::Gray)));
-    spans.push(Span::styled(format!("  {temp_txt:>5}"), fg(temp_color)));
-    spans.push(Span::raw("  "));
-    spans.push(health_dot(dev.health.as_ref()));
+    if mid_w < 16 {
+        mid.push(Span::raw(" ".repeat(16 - mid_w)));
+    } else {
+        mid.push(Span::raw(" "));
+    }
+    spans.extend(mid);
+
+    // Aggregate usage bar for the whole drive.
+    let (used, known) = disk_used(dev);
+    let total = dev.size;
+    if known && total > 0 {
+        let frac = (used as f64 / total as f64).clamp(0.0, 1.0);
+        spans.extend(bar_spans(frac, 10));
+        spans.push(Span::styled(format!(" {:>3.0}%", frac * 100.0), fg(format::usage_color(frac))));
+        spans.push(Span::styled(
+            format!("  {:>5} / {:>5}", format::human_bytes(used), format::human_bytes(total)),
+            fg(MUTED),
+        ));
+    } else {
+        spans.push(Span::styled(" ".repeat(10), fg(MUTED)));
+        spans.push(Span::styled(format!("    n/a / {:>5}", format::human_bytes(total)), fg(MUTED)));
+    }
     Line::from(spans)
 }
 
