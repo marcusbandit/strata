@@ -39,11 +39,22 @@ pub enum Mode {
     Drill(DrillState),
     Mount(MountState),
     Search(SearchState),
+    Yank(YankState),
 }
 
 /// Live tree filter editor: what the user is typing narrows the tree as they go.
 pub struct SearchState {
     pub input: String,
+}
+
+/// A little "copy which fact?" menu for the selected device. The facts are
+/// snapshotted on entry so the picker does not re-borrow the tree.
+pub struct YankState {
+    pub name: String,
+    pub path: String,
+    pub uuid: Option<String>,
+    pub mount: Option<String>,
+    pub label: Option<String>,
 }
 
 /// Whether a [`MountState`] is about to mount or unmount its device.
@@ -370,6 +381,20 @@ impl App {
     pub fn clear_filter(&mut self) {
         self.filter = None;
         self.rebuild_rows();
+    }
+
+    /// Open the "copy which fact?" menu for the selected device.
+    pub fn begin_yank(&mut self) {
+        let Some(dev) = self.selected_dev() else {
+            return;
+        };
+        self.mode = Mode::Yank(YankState {
+            name: self.display_name(dev),
+            path: dev.path.clone(),
+            uuid: dev.uuid.clone(),
+            mount: dev.primary_mount().map(str::to_string),
+            label: dev.label.clone(),
+        });
     }
 
     /// Resolve a row's index path back to the device it points at.

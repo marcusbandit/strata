@@ -124,7 +124,56 @@ fn handle_key(app: &mut App, code: KeyCode) {
         Mode::Label(_) => handle_label(app, code),
         Mode::Mount(_) => handle_mount(app, code),
         Mode::Search(_) => handle_search(app, code),
+        Mode::Yank(_) => handle_yank(app, code),
         Mode::Drill(_) => handle_drill(app, code),
+    }
+}
+
+/// The "copy which fact?" picker: a key selects a fact to put on the clipboard.
+fn handle_yank(app: &mut App, code: KeyCode) {
+    if code == KeyCode::Esc {
+        app.mode = Mode::Overview;
+        return;
+    }
+    let picked: Option<(String, &'static str)> = match &app.mode {
+        Mode::Yank(y) => match code {
+            KeyCode::Char('p') => Some((y.path.clone(), "path")),
+            KeyCode::Char('u') => y.uuid.clone().map(|v| (v, "uuid")),
+            KeyCode::Char('m') => y.mount.clone().map(|v| (v, "mountpoint")),
+            KeyCode::Char('l') => y.label.clone().map(|v| (v, "label")),
+            KeyCode::Char('n') => Some((y.name.clone(), "name")),
+            _ => None,
+        },
+        _ => return,
+    };
+    if let Some((value, what)) = picked {
+        let ok = copy_to_clipboard(&value);
+        app.status = Some(if ok {
+            format!("copied {what}: {value}")
+        } else {
+            "no clipboard tool (wl-copy/xclip) found".into()
+        });
+        app.mode = Mode::Overview;
+    }
+    // A key that is not one of the offered facts is ignored (menu stays open).
+}
+
+/// Open the selected device's mountpoint in the desktop file manager.
+fn open_mountpoint(app: &mut App) {
+    let mp = app.selected_dev().and_then(|d| d.primary_mount()).map(str::to_string);
+    match mp {
+        Some(mp) => {
+            let spawned = std::process::Command::new("xdg-open")
+                .arg(&mp)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            app.status = Some(match spawned {
+                Ok(_) => format!("opened {mp}"),
+                Err(_) => "could not run xdg-open".into(),
+            });
+        }
+        None => app.status = Some("not mounted, nothing to open".into()),
     }
 }
 
@@ -196,6 +245,8 @@ fn handle_overview(app: &mut App, code: KeyCode) {
         KeyCode::Char('r') => app.begin_rename(),
         KeyCode::Char('L') => app.begin_label(),
         KeyCode::Char('m') => app.begin_mount(),
+        KeyCode::Char('y') => app.begin_yank(),
+        KeyCode::Char('o') => open_mountpoint(app),
         KeyCode::Char('d') => app.begin_drill(),
         KeyCode::Char('i') => app.toggle_detail(),
         KeyCode::Char('R') => app.refresh(),
@@ -327,6 +378,7 @@ fn draw(f: &mut Frame, app: &App) {
         Mode::Rename(state) => draw_rename(f, f.area(), state),
         Mode::Label(state) => draw_label(f, f.area(), state),
         Mode::Mount(state) => draw_mount(f, f.area(), state),
+        Mode::Yank(state) => draw_yank(f, f.area(), state),
         _ => {}
     }
 }
@@ -769,6 +821,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         Mode::Label(_) => " type a label · enter preview command · esc cancel",
         Mode::Mount(_) => " y confirm · n / esc cancel",
         Mode::Search(_) => " type to filter · enter keep · esc clear",
+        Mode::Yank(_) => " p path · n name · m mount · l label · u uuid · esc cancel",
         Mode::Help => " any key to close",
         Mode::Overview if app.filter.is_some() => {
             " j/k move · / edit filter · esc clear filter · enter expand · q quit"
@@ -852,6 +905,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         help_row("enter / space", "expand or collapse a drive"),
         help_row("r", "give the selected disk a nickname"),
         help_row("m", "mount, or unmount (asks first), the selected filesystem"),
+        help_row("o", "open the mountpoint in your file manager"),
+        help_row("y", "copy a fact (path, uuid, mount, label) to the clipboard"),
         help_row("L", "set the real on-disk label (applies it, asks for sudo)"),
         help_row("d", "drill into what is using the space"),
         help_row("i", "show/hide the detail panel (more columns)"),
@@ -1074,6 +1129,40 @@ fn draw_mount(f: &mut Frame, area: Rect, state: &MountState) {
     f.render_widget(Clear, popup);
     f.render_widget(
         Paragraph::new(Text::from(lines)).block(bordered_title(title)).wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn draw_yank(f: &mut Frame, area: Rect, state: &crate::app::YankState) {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("Copy which fact of {} ?", state.name),
+            Style::default().fg(HEADER),
+        )),
+        Line::raw(""),
+    ];
+    // Only offer facts the device actually has; each pairs a key with its value.
+    let mut row = |key: &'static str, what: &str, val: Option<&str>| {
+        if let Some(v) = val {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {key}"), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("  {what:<11}"), fg(MUTED)),
+                Span::styled(v.to_string(), fg(HEADER)),
+            ]));
+        }
+    };
+    row("p", "path", Some(&state.path));
+    row("n", "name", Some(&state.name));
+    row("m", "mountpoint", state.mount.as_deref());
+    row("l", "label", state.label.as_deref());
+    row("u", "uuid", state.uuid.as_deref());
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled("press a key to copy · esc: cancel", fg(MUTED))));
+
+    let popup = centered(area, 68, 40);
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).block(bordered_title(" copy ")).wrap(Wrap { trim: false }),
         popup,
     );
 }
