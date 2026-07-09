@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 mod model;
+mod naming;
 mod probe;
 
 use anyhow::Result;
