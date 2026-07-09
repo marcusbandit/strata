@@ -8,6 +8,7 @@
 use crate::app::{App, DrillState, LabelState, Mode, RenameState};
 use crate::format;
 use crate::model::{Dev, Health};
+use crate::naming;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::crossterm::terminal::{
@@ -75,6 +76,9 @@ fn event_loop(term: &mut Term, app: &mut App) -> anyhow::Result<()> {
                 }
             }
         }
+        // A confirmed label apply needs the terminal (sudo prompts on it), so it
+        // runs here in the loop rather than inside a plain App method.
+        maybe_apply_label(term, app);
         app.poll_drill();
         if app.should_quit {
             return Ok(());
@@ -133,13 +137,32 @@ fn handle_rename(app: &mut App, code: KeyCode) {
 }
 
 fn handle_label(app: &mut App, code: KeyCode) {
-    // Two phases: editing the label, then reviewing the generated command.
-    let reviewing = matches!(&app.mode, Mode::Label(s) if s.command.is_some());
-    if reviewing {
-        match code {
+    // Three phases: 0 typing the label, 1 previewing the command, 2 showing the
+    // result of the apply attempt.
+    let phase = match &app.mode {
+        Mode::Label(s) if s.outcome.is_some() => 2,
+        Mode::Label(s) if s.plan.is_some() => 1,
+        Mode::Label(_) => 0,
+        _ => return,
+    };
+    match phase {
+        // Result shown: any key closes and re-reads so the new label appears.
+        2 => app.refresh(),
+        // Preview: apply, copy the command, or cancel.
+        1 => match code {
+            KeyCode::Esc => app.mode = Mode::Overview,
+            KeyCode::Enter => {
+                if let Mode::Label(s) = &mut app.mode {
+                    s.apply = true; // the event loop runs the escalated apply
+                }
+            }
             KeyCode::Char('c') => {
                 let cmd = match &app.mode {
-                    Mode::Label(s) => s.command.clone().unwrap_or_default(),
+                    Mode::Label(s) => s
+                        .plan
+                        .as_ref()
+                        .map(|p| crate::app::render_command(p, s.mountpoint.as_deref()))
+                        .unwrap_or_default(),
                     _ => String::new(),
                 };
                 let ok = copy_to_clipboard(&cmd);
@@ -149,25 +172,24 @@ fn handle_label(app: &mut App, code: KeyCode) {
                     "no clipboard tool (wl-copy/xclip) found".into()
                 });
             }
-            KeyCode::Esc | KeyCode::Enter => app.mode = Mode::Overview,
             _ => {}
-        }
-    } else {
-        match code {
+        },
+        // Typing: edit the label, preview on Enter.
+        _ => match code {
             KeyCode::Esc => app.mode = Mode::Overview,
             KeyCode::Enter => app.confirm_label(),
             KeyCode::Backspace => {
-                if let Mode::Label(state) = &mut app.mode {
-                    state.input.pop();
+                if let Mode::Label(s) = &mut app.mode {
+                    s.input.pop();
                 }
             }
             KeyCode::Char(c) => {
-                if let Mode::Label(state) = &mut app.mode {
-                    state.input.push(c);
+                if let Mode::Label(s) = &mut app.mode {
+                    s.input.push(c);
                 }
             }
             _ => {}
-        }
+        },
     }
 }
 
@@ -709,7 +731,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         help_row("g / G", "jump to top / bottom"),
         help_row("enter / space", "expand or collapse a drive"),
         help_row("r", "give the selected disk a nickname"),
-        help_row("L", "set the real filesystem label (shows the command)"),
+        help_row("L", "set the real on-disk label (applies it, asks for sudo)"),
         help_row("d", "drill into what is using the space"),
         help_row("i", "show/hide the detail panel (more columns)"),
         help_row("R", "re-read all disks"),
@@ -760,38 +782,67 @@ fn draw_rename(f: &mut Frame, area: Rect, state: &RenameState) {
 fn draw_label(f: &mut Frame, area: Rect, state: &LabelState) {
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("filesystem  ", Style::default().fg(MUTED)),
-            Span::styled(format!("{} on {}", state.fstype, state.device_path), Style::default().fg(HEADER)),
+            Span::styled("filesystem  ", fg(MUTED)),
+            Span::styled(format!("{} on {}", state.fstype, state.device_path), fg(HEADER)),
         ]),
         Line::raw(""),
     ];
-    if let Some(cmd) = &state.command {
-        lines.push(Line::from(Span::styled("Run this to set the real label:", Style::default().fg(HEADER))));
+
+    if let Some(outcome) = &state.outcome {
+        // Phase 3: result of the apply attempt.
+        match outcome {
+            Ok(msg) => lines.push(Line::from(Span::styled(
+                format!("done: {msg}"),
+                Style::default().fg(Color::Rgb(0x7c, 0xb3, 0x9b)).add_modifier(Modifier::BOLD),
+            ))),
+            Err(msg) => lines.push(Line::from(Span::styled(
+                msg.clone(),
+                Style::default().fg(Color::Rgb(0xd0, 0x6f, 0x6f)),
+            ))),
+        }
         lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(cmd.clone(), Style::default().fg(ACCENT))));
+        lines.push(Line::from(Span::styled("any key to close", fg(MUTED))));
+    } else if let Some(plan) = &state.plan {
+        // Phase 2: preview and confirm.
+        lines.push(Line::from(Span::styled("This will run:", fg(HEADER))));
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            "strata does not run this for you: it needs root (and NTFS needs unmounting).",
+            crate::app::render_command(plan, state.mountpoint.as_deref()),
+            fg(ACCENT),
+        )));
+        lines.push(Line::raw(""));
+        if plan.needs_unmount {
+            lines.push(Line::from(Span::styled(
+                "The drive will be briefly unmounted, relabeled, and remounted.",
+                Style::default().fg(Color::Rgb(0xd4, 0xb0, 0x6a)),
+            )));
+        }
+        lines.push(Line::from(Span::styled(plan.note.clone(), fg(MUTED))));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "strata tries directly, then sudo (prompts here), then a graphical popup.",
             Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
         )));
         lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled("c copy · enter/esc close", Style::default().fg(MUTED))));
+        lines.push(Line::from(Span::styled("enter: apply · c: copy command · esc: cancel", fg(MUTED))));
     } else {
+        // Phase 1: type the label.
         lines.push(Line::from(vec![
-            Span::styled("new label  ", Style::default().fg(MUTED)),
-            Span::styled(state.input.clone(), Style::default().fg(HEADER)),
-            Span::styled("▏", Style::default().fg(ACCENT)),
+            Span::styled("new label  ", fg(MUTED)),
+            Span::styled(state.input.clone(), fg(HEADER)),
+            Span::styled("▏", fg(ACCENT)),
         ]));
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            "This changes the real on-disk label (what lsblk shows everywhere).",
+            "This changes the real on-disk label (what every tool sees).",
             Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
         )));
-        lines.push(Line::from(Span::styled("Tip: press r instead for a private nickname.", Style::default().fg(MUTED))));
+        lines.push(Line::from(Span::styled("Tip: press r instead for a private nickname.", fg(MUTED))));
         lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled("enter preview command · esc cancel", Style::default().fg(MUTED))));
+        lines.push(Line::from(Span::styled("enter: preview · esc: cancel", fg(MUTED))));
     }
-    let popup = centered(area, 70, 45);
+
+    let popup = centered(area, 74, 55);
     f.render_widget(Clear, popup);
     f.render_widget(
         Paragraph::new(Text::from(lines)).block(bordered_title(" set real label ")).wrap(Wrap { trim: false }),
@@ -852,6 +903,122 @@ fn truncate(s: &str, max: usize) -> String {
         let kept: String = s.chars().take(max.saturating_sub(1)).collect();
         format!("{kept}…")
     }
+}
+
+// ===== label apply (privilege escalation) ===================================
+
+/// If the user confirmed a label apply, run it (with terminal access for sudo)
+/// and record the outcome on the label state.
+fn maybe_apply_label(term: &mut Term, app: &mut App) {
+    let (plan, mp) = match &app.mode {
+        Mode::Label(s) if s.apply && s.outcome.is_none() => match &s.plan {
+            Some(p) => (p.clone(), s.mountpoint.clone()),
+            None => return,
+        },
+        _ => return,
+    };
+    let outcome = apply_label(term, &plan, mp.as_deref());
+    if let Mode::Label(s) = &mut app.mode {
+        s.apply = false;
+        s.outcome = Some(outcome);
+    }
+}
+
+/// Write the filesystem label, escalating privileges only as far as needed:
+///
+/// 1. run it directly (works if strata is already root or holds the capability),
+/// 2. else `sudo` on the real terminal (its password / face prompt shows there),
+/// 3. else `pkexec` (a graphical polkit popup),
+/// 4. else give up and hand the user the exact command.
+///
+/// Returns `Ok(message)` on success or `Err(message)` with guidance on failure.
+fn apply_label(term: &mut Term, plan: &naming::LabelPlan, mp: Option<&str>) -> Result<String, String> {
+    let script = build_script(plan, mp);
+    let shown = crate::app::render_command(plan, mp);
+
+    // 1. Directly.
+    let (ok, first_err) = run_captured("sh", &["-c", &script]);
+    if ok {
+        return Ok("label set".into());
+    }
+
+    // 2. sudo, with the TUI suspended so its prompt can use the terminal.
+    if let Some(true) = run_suspended(
+        term,
+        "sudo",
+        &["sh", "-c", &script],
+        "Setting the filesystem label needs root. Authenticate for sudo below:",
+    ) {
+        return Ok("label set (via sudo)".into());
+    }
+
+    // 3. pkexec: a graphical authentication popup.
+    let (pk_ok, _) = run_captured("pkexec", &["sh", "-c", &script]);
+    if pk_ok {
+        return Ok("label set (via pkexec)".into());
+    }
+
+    // 4. Out of options.
+    let reason = first_err
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("permission denied")
+        .trim();
+    Err(format!(
+        "could not set it automatically ({reason}). Run `sudo strata`, or run this yourself:  {shown}"
+    ))
+}
+
+/// Run a command, capturing whether it succeeded and its stderr.
+fn run_captured(program: &str, args: &[&str]) -> (bool, String) {
+    match std::process::Command::new(program).args(args).output() {
+        Ok(o) => (o.status.success(), String::from_utf8_lossy(&o.stderr).into_owned()),
+        Err(e) => (false, e.to_string()),
+    }
+}
+
+/// Leave the alternate screen, run an interactive command (so it can prompt on
+/// the real terminal), then restore the TUI. Returns `None` if the program
+/// could not be started at all (e.g. sudo is not installed).
+fn run_suspended(term: &mut Term, program: &str, args: &[&str], notice: &str) -> Option<bool> {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    println!("\n{notice}\n");
+    let _ = io::stdout().flush();
+
+    let status = std::process::Command::new(program).args(args).status();
+
+    let _ = enable_raw_mode();
+    let _ = execute!(io::stdout(), EnterAlternateScreen);
+    let _ = term.clear();
+
+    match status {
+        Ok(s) => Some(s.success()),
+        Err(_) => None,
+    }
+}
+
+/// The shell one-liner that performs the relabel. For filesystems that must be
+/// unmounted first (NTFS), it unmounts, relabels, and remounts. Every argument
+/// is shell-quoted so labels and paths with spaces are safe.
+fn build_script(plan: &naming::LabelPlan, mp: Option<&str>) -> String {
+    let cmd = std::iter::once(plan.program.clone())
+        .chain(plan.args.iter().cloned())
+        .map(|a| shell_quote(&a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if plan.needs_unmount {
+        if let Some(m) = mp {
+            let q = shell_quote(m);
+            return format!("umount {q} && {cmd} && mount {q}");
+        }
+    }
+    cmd
+}
+
+/// Single-quote a string for safe use inside a `sh -c` command.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
@@ -921,6 +1088,53 @@ mod tests {
         assert!(text.contains("root"), "root mount highlighted");
         assert!(text.contains("WD_BLACK"), "model shown in detail panel");
         assert!(text.contains('█'), "a usage bar is drawn");
+    }
+
+    #[test]
+    fn label_preview_shows_command_and_escalation() {
+        let mut app = demo_app();
+        let plan = naming::label_command("btrfs", "/dev/nvme0n1p2", Some("/"), "Root").unwrap();
+        app.mode = Mode::Label(LabelState {
+            device_path: "/dev/nvme0n1p2".into(),
+            fstype: "btrfs".into(),
+            mountpoint: Some("/".into()),
+            input: "Root".into(),
+            plan: Some(plan),
+            apply: false,
+            outcome: None,
+        });
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let text = format!("{}", term.backend());
+        assert!(text.contains("set real label"), "modal title");
+        assert!(text.contains("This will run"), "preview heading");
+        assert!(text.contains("sudo btrfs filesystem label"), "the actual command");
+        assert!(text.contains("sudo"), "mentions the escalation");
+        assert!(text.contains("apply"), "apply hint");
+    }
+
+    #[test]
+    fn build_script_quotes_and_wraps_unmount() {
+        // Simple relabel (no unmount): every argument is single-quoted.
+        let plan = naming::label_command("btrfs", "/dev/nvme0n1p2", Some("/"), "My Root").unwrap();
+        let script = build_script(&plan, Some("/"));
+        assert_eq!(script, "'btrfs' 'filesystem' 'label' '/' 'My Root'");
+
+        // NTFS: unmount, relabel, remount, all quoted.
+        let plan = naming::label_command("ntfs", "/dev/sda1", Some("/mnt/my data"), "Movies").unwrap();
+        let script = build_script(&plan, Some("/mnt/my data"));
+        assert_eq!(
+            script,
+            "umount '/mnt/my data' && 'ntfslabel' '/dev/sda1' 'Movies' && mount '/mnt/my data'"
+        );
+    }
+
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        // An embedded single quote is closed, escaped, and reopened.
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
     }
 
     /// Render the real machine to a snapshot for eyeballing alignment. Ignored

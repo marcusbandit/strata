@@ -31,9 +31,11 @@ main view never gets noisy.
   and notes) stored in `~/.config/strata/config.toml`, keyed by filesystem UUID
   so it survives remounts. Safe, reversible, works on mounted NTFS, no sudo.
 - **Real labels (`L`)** change the on-disk filesystem label that every tool sees
-  (`lsblk`, the file manager, etc.). strata works out the exact command for the
-  filesystem type and hands it to you to run, rather than escalating privileges
-  from inside a TUI. NTFS labels need the drive unmounted; strata spells that out.
+  (`lsblk`, the file manager, other machines). strata shows you the exact command
+  first, then applies it, escalating only as far as needed: it tries directly,
+  then `sudo` (prompting in the terminal), then a graphical `pkexec` popup, and
+  if all of those fail it hands you the command to run yourself. NTFS filesystems
+  are unmounted, relabeled, and remounted automatically.
 
 ## Keys
 

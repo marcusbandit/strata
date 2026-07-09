@@ -48,14 +48,20 @@ pub struct RenameState {
     pub input: String,
 }
 
-/// Real-filesystem-label flow: collect a new label, then show the exact command.
+/// Real-filesystem-label flow: type a label, preview the command, then apply it
+/// (escalating privileges as needed).
 pub struct LabelState {
     pub device_path: String,
     pub fstype: String,
     pub mountpoint: Option<String>,
     pub input: String,
-    /// Once the user confirms, the ready-to-run command line is filled in here.
-    pub command: Option<String>,
+    /// The planned relabel command, filled in once the user previews it.
+    pub plan: Option<naming::LabelPlan>,
+    /// Set when the user confirms; the event loop consumes it to run the apply
+    /// (which needs the terminal so sudo can prompt).
+    pub apply: bool,
+    /// Result of the apply attempt: `Ok(msg)` on success, `Err(msg)` on failure.
+    pub outcome: Option<Result<String, String>>,
 }
 
 /// Space drill-down: a background walk of a directory, one level at a time.
@@ -342,30 +348,32 @@ impl App {
             fstype,
             mountpoint: dev.primary_mount().map(str::to_string),
             input: dev.label.clone().unwrap_or_default(),
-            command: None,
+            plan: None,
+            apply: false,
+            outcome: None,
         });
     }
 
-    /// Turn the typed label into a concrete, copy-pasteable command line.
-    ///
-    /// We deliberately do NOT execute it: real relabels need root (and NTFS
-    /// needs an unmount), so we hand the user the exact command to run under
-    /// their own privilege path instead of escalating from inside a TUI.
+    /// Turn the typed label into a concrete [`naming::LabelPlan`] and move to the
+    /// preview step. The actual execution happens in the UI layer (it needs the
+    /// terminal so sudo can prompt).
     pub fn confirm_label(&mut self) {
+        let (fstype, path, mp, new) = match &self.mode {
+            Mode::Label(s) => (
+                s.fstype.clone(),
+                s.device_path.clone(),
+                s.mountpoint.clone(),
+                s.input.trim().to_string(),
+            ),
+            _ => return,
+        };
+        if new.is_empty() {
+            self.status = Some("label cannot be empty".into());
+            return;
+        }
+        let plan = naming::label_command(&fstype, &path, mp.as_deref(), &new);
         if let Mode::Label(state) = &mut self.mode {
-            let new = state.input.trim();
-            if new.is_empty() {
-                self.status = Some("label cannot be empty".into());
-                return;
-            }
-            if let Some(plan) = naming::label_command(
-                &state.fstype,
-                &state.device_path,
-                state.mountpoint.as_deref(),
-                new,
-            ) {
-                state.command = Some(render_command(&plan, state.mountpoint.as_deref()));
-            }
+            state.plan = plan;
         }
     }
 
@@ -500,7 +508,7 @@ fn spawn_scan(dir: PathBuf) -> Receiver<anyhow::Result<Vec<Entry>>> {
 
 /// Build the human command line for a label plan (with `sudo` and any unmount
 /// step spelled out), for display and copy-paste.
-fn render_command(plan: &naming::LabelPlan, mountpoint: Option<&str>) -> String {
+pub fn render_command(plan: &naming::LabelPlan, mountpoint: Option<&str>) -> String {
     let mut parts = Vec::new();
     if plan.needs_unmount {
         if let Some(mp) = mountpoint {
