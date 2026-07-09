@@ -5,7 +5,9 @@
 //! master-detail: a drive tree on the left, a detail panel on the right that
 //! carries the depth so the overview itself stays uncluttered.
 
-use crate::app::{App, DrillState, LabelState, Mode, MountAction, MountState, NameKind, RenameState};
+use crate::app::{
+    App, DrillState, LabelState, Mode, MountAction, MountState, NameKind, RenameState,
+};
 use crate::format::{self, fit, ACCENT, HEADER, MOUNT_W, MUTED, NAME_W, NICK};
 use crate::model::{Dev, Health};
 use crate::naming;
@@ -121,7 +123,33 @@ fn handle_key(app: &mut App, code: KeyCode) {
         Mode::Rename(_) => handle_rename(app, code),
         Mode::Label(_) => handle_label(app, code),
         Mode::Mount(_) => handle_mount(app, code),
+        Mode::Search(_) => handle_search(app, code),
         Mode::Drill(_) => handle_drill(app, code),
+    }
+}
+
+fn handle_search(app: &mut App, code: KeyCode) {
+    match code {
+        // Esc abandons the search and clears the filter; Enter keeps it and
+        // returns to the tree (so you can navigate the filtered results).
+        KeyCode::Esc => {
+            app.clear_filter();
+            app.mode = Mode::Overview;
+        }
+        KeyCode::Enter => app.mode = Mode::Overview,
+        KeyCode::Backspace => {
+            if let Mode::Search(s) = &mut app.mode {
+                s.input.pop();
+            }
+            app.apply_search();
+        }
+        KeyCode::Char(c) => {
+            if let Mode::Search(s) = &mut app.mode {
+                s.input.push(c);
+            }
+            app.apply_search();
+        }
+        _ => {}
     }
 }
 
@@ -150,7 +178,16 @@ fn handle_mount(app: &mut App, code: KeyCode) {
 
 fn handle_overview(app: &mut App, code: KeyCode) {
     match code {
-        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+        KeyCode::Char('q') => app.should_quit = true,
+        // Esc clears an active filter first; only quits when there is none.
+        KeyCode::Esc => {
+            if app.filter.is_some() {
+                app.clear_filter();
+            } else {
+                app.should_quit = true;
+            }
+        }
+        KeyCode::Char('/') => app.begin_search(),
         KeyCode::Char('j') | KeyCode::Down => app.move_selection(1),
         KeyCode::Char('k') | KeyCode::Up => app.move_selection(-1),
         KeyCode::Char('g') | KeyCode::Home => app.select_first(),
@@ -297,11 +334,17 @@ fn draw(f: &mut Frame, app: &App) {
 fn draw_title(f: &mut Frame, area: Rect, app: &App) {
     let total: u64 = app.snapshot.drives.iter().map(|d| d.size).sum();
     let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(28)]).split(area);
-    let left = Line::from(vec![
+    let mut left_spans = vec![
         Span::styled(" strata ", Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)),
         Span::raw(" "),
         Span::styled("storage overview", Style::default().fg(HEADER)),
-    ]);
+    ];
+    // Show any active filter right after the title so it is unmistakable.
+    if let Some(q) = &app.filter {
+        left_spans.push(Span::styled("   filter: ", Style::default().fg(MUTED)));
+        left_spans.push(Span::styled(q.clone(), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
+    }
+    let left = Line::from(left_spans);
     let right = Line::from(Span::styled(
         format!("{} drives · {} total ", app.snapshot.drives.len(), format::human_bytes(total)),
         Style::default().fg(MUTED),
@@ -329,6 +372,15 @@ fn draw_tree(f: &mut Frame, area: Rect, app: &App, verbose: bool) {
     // spacers are not real rows, we track where the selected row lands.
     let mut items = vec![column_header(verbose)];
     let mut selected_item = 1usize;
+    // A filter that matches nothing gets an explanatory line instead of a blank.
+    if app.rows.is_empty() {
+        if let Some(q) = &app.filter {
+            items.push(ListItem::new(Line::from(Span::styled(
+                format!("  no device matches \"{q}\"  (esc to clear)"),
+                Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+            ))));
+        }
+    }
     for (i, row) in app.rows.iter().enumerate() {
         if row.is_disk && i != 0 {
             items.push(ListItem::new(Line::from("")));
@@ -693,6 +745,17 @@ fn health_line(health: Option<&Health>) -> Line<'static> {
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
+    // The live search editor owns the footer while it is open.
+    if let Mode::Search(s) = &app.mode {
+        let line = Line::from(vec![
+            Span::styled(" /", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" {}", s.input), Style::default().fg(HEADER)),
+            Span::styled("\u{258f}", Style::default().fg(ACCENT)),
+            Span::styled("   enter: keep · esc: clear", Style::default().fg(MUTED)),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
     if let Some(status) = &app.status {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(format!(" {status}"), Style::default().fg(ACCENT)))),
@@ -705,8 +768,12 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         Mode::Rename(_) => " type a nickname · enter save · esc cancel",
         Mode::Label(_) => " type a label · enter preview command · esc cancel",
         Mode::Mount(_) => " y confirm · n / esc cancel",
+        Mode::Search(_) => " type to filter · enter keep · esc clear",
         Mode::Help => " any key to close",
-        Mode::Overview => " j/k move · enter expand · r name · m mount · L label · d drill · i panel · ? help · q quit",
+        Mode::Overview if app.filter.is_some() => {
+            " j/k move · / edit filter · esc clear filter · enter expand · q quit"
+        }
+        Mode::Overview => " j/k move · / find · enter expand · r name · m mount · L label · d drill · ? help · q quit",
     };
     f.render_widget(Paragraph::new(Line::from(Span::styled(hints, Style::default().fg(MUTED)))), area);
 }
@@ -780,6 +847,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from(Span::styled("strata · keys", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))),
         Line::raw(""),
         help_row("j / k, ↑ ↓", "move selection"),
+        help_row("/", "filter the tree (name, label, mount, nickname); esc clears"),
         help_row("g / G", "jump to top / bottom"),
         help_row("enter / space", "expand or collapse a drive"),
         help_row("r", "give the selected disk a nickname"),
@@ -1323,6 +1391,7 @@ mod tests {
             mode: Mode::Overview,
             status: None,
             show_detail: true,
+            filter: None,
             should_quit: false,
         };
         app.rebuild_rows();

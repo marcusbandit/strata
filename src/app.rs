@@ -38,6 +38,12 @@ pub enum Mode {
     Label(LabelState),
     Drill(DrillState),
     Mount(MountState),
+    Search(SearchState),
+}
+
+/// Live tree filter editor: what the user is typing narrows the tree as they go.
+pub struct SearchState {
+    pub input: String,
 }
 
 /// Whether a [`MountState`] is about to mount or unmount its device.
@@ -153,6 +159,9 @@ pub struct App {
     /// Whether the right-hand detail panel is shown. Hiding it gives the tree
     /// the full width and turns on the extra columns (device id, fs, bytes).
     pub show_detail: bool,
+    /// Active tree filter: only devices whose subtree matches are shown. `None`
+    /// (or empty) means everything is visible.
+    pub filter: Option<String>,
     pub should_quit: bool,
 }
 
@@ -173,6 +182,7 @@ impl App {
             mode: Mode::Overview,
             status: None,
             show_detail: true,
+            filter: None,
             should_quit: false,
         };
         app.rebuild_rows();
@@ -287,14 +297,79 @@ impl App {
 
     /// Flatten the drive tree into visible [`Row`]s, honoring `collapsed`.
     pub fn rebuild_rows(&mut self) {
+        let filter = self.filter.clone().filter(|q| !q.is_empty());
         let mut rows = Vec::new();
         for (i, drive) in self.snapshot.drives.iter().enumerate() {
-            flatten(drive, vec![i], 0, &self.collapsed, &mut rows);
+            match &filter {
+                Some(q) => self.flatten_filtered(drive, vec![i], 0, q, &mut rows),
+                None => flatten(drive, vec![i], 0, &self.collapsed, &mut rows),
+            }
         }
         self.rows = rows;
         if self.selected >= self.rows.len() {
             self.selected = self.rows.len().saturating_sub(1);
         }
+    }
+
+    /// Like [`flatten`] but keeps only devices whose subtree matches `q`, and
+    /// ignores collapse (so every match is visible). Ancestors of a match are
+    /// kept for context, so you always see the path down to it.
+    fn flatten_filtered(&self, dev: &Dev, path: Vec<usize>, depth: usize, q: &str, out: &mut Vec<Row>) {
+        if !self.subtree_matches(dev, q) {
+            return;
+        }
+        let visible_child = dev.children.iter().any(|c| self.subtree_matches(c, q));
+        out.push(Row {
+            path: path.clone(),
+            depth,
+            name: dev.name.clone(),
+            is_disk: dev.is_disk(),
+            has_children: visible_child,
+        });
+        for (i, child) in dev.children.iter().enumerate() {
+            let mut child_path = path.clone();
+            child_path.push(i);
+            self.flatten_filtered(child, child_path, depth + 1, q, out);
+        }
+    }
+
+    /// Whether `dev` or any descendant matches the filter `q`.
+    fn subtree_matches(&self, dev: &Dev, q: &str) -> bool {
+        self.dev_matches_filter(dev, q) || dev.children.iter().any(|c| self.subtree_matches(c, q))
+    }
+
+    /// Whether `dev` itself matches `q` (case-insensitive substring) on any of
+    /// its human-facing fields: kernel name, label, nickname, fstype, mountpoint.
+    fn dev_matches_filter(&self, dev: &Dev, q: &str) -> bool {
+        let q = q.to_ascii_lowercase();
+        let hay = |s: &str| s.to_ascii_lowercase().contains(&q);
+        hay(&dev.name)
+            || dev.label.as_deref().is_some_and(hay)
+            || dev.fstype.as_deref().is_some_and(hay)
+            || dev.mountpoints.iter().any(|m| hay(m.as_str()))
+            || self.nickname(dev).as_deref().is_some_and(hay)
+    }
+
+    /// Open the live filter editor, seeded with the current filter.
+    pub fn begin_search(&mut self) {
+        let input = self.filter.clone().unwrap_or_default();
+        self.mode = Mode::Search(SearchState { input });
+    }
+
+    /// Push the search editor's text into the active filter and rebuild the tree.
+    pub fn apply_search(&mut self) {
+        let q = match &self.mode {
+            Mode::Search(s) => s.input.trim().to_string(),
+            _ => return,
+        };
+        self.filter = if q.is_empty() { None } else { Some(q) };
+        self.rebuild_rows();
+    }
+
+    /// Drop any active filter and show the whole tree again.
+    pub fn clear_filter(&mut self) {
+        self.filter = None;
+        self.rebuild_rows();
     }
 
     /// Resolve a row's index path back to the device it points at.
@@ -736,6 +811,7 @@ mod tests {
             mode: Mode::Overview,
             status: None,
             show_detail: true,
+            filter: None,
             should_quit: false,
         };
         app.rebuild_rows();
@@ -755,6 +831,31 @@ mod tests {
         assert_eq!(app.rows[1].name, "nvme0n1p1");
         assert_eq!(app.rows[1].depth, 1);
         assert_eq!(app.rows[3].name, "sda");
+    }
+
+    #[test]
+    fn filter_keeps_matches_and_their_parent_disk() {
+        let mut app = app_with(vec![
+            disk("nvme0n1", vec![part("nvme0n1p1", None), part("games", None)]),
+            disk("sda", vec![part("sda1", None)]),
+        ]);
+        app.filter = Some("games".to_string());
+        app.rebuild_rows();
+        // Only the matching partition and its parent disk (for context) remain.
+        let names: Vec<&str> = app.rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["nvme0n1", "games"]);
+    }
+
+    #[test]
+    fn filter_is_case_insensitive_partial_and_can_empty() {
+        let mut app = app_with(vec![disk("nvme0n1", vec![part("BackupVolume", None)])]);
+        app.filter = Some("backup".to_string());
+        app.rebuild_rows();
+        assert_eq!(app.rows.iter().filter(|r| r.name == "BackupVolume").count(), 1);
+        // A filter that matches nothing yields an empty tree (the UI shows a hint).
+        app.filter = Some("zzz".to_string());
+        app.rebuild_rows();
+        assert!(app.rows.is_empty());
     }
 
     #[test]
