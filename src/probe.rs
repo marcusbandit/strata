@@ -2,3 +2,4 @@
 
 pub mod health;
 pub mod lsblk;
+pub mod space;
