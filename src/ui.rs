@@ -237,17 +237,26 @@ fn draw_overview(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_tree(f: &mut Frame, area: Rect, app: &App, verbose: bool) {
     // A non-selectable column header sits at the top so the first column reads
-    // clearly as "the name" and the rest are labelled too.
+    // clearly as "the name" and the rest are labelled too. A blank spacer goes
+    // before each disk so the drive groups are visually separated; because the
+    // spacers are not real rows, we track where the selected row lands.
     let mut items = vec![column_header(verbose)];
-    items.extend(app.rows.iter().map(|row| {
+    let mut selected_item = 1usize;
+    for (i, row) in app.rows.iter().enumerate() {
+        if row.is_disk && i != 0 {
+            items.push(ListItem::new(Line::from("")));
+        }
+        if i == app.selected {
+            selected_item = items.len();
+        }
         let dev = app.dev_at(&row.path);
         let line = match dev {
             Some(d) if row.is_disk => disk_line(app, d, &app.collapsed_marker(row), verbose),
             Some(d) => part_line(app, d, row.depth, verbose),
             None => Line::from("?"),
         };
-        ListItem::new(line)
-    }));
+        items.push(ListItem::new(line));
+    }
 
     let title = if verbose {
         " drives · i: show detail panel "
@@ -267,8 +276,7 @@ fn draw_tree(f: &mut Frame, area: Rect, app: &App, verbose: bool) {
 
     let mut state = ListState::default();
     if !app.rows.is_empty() {
-        // +1 because the header occupies list index 0 and is never selected.
-        state.select(Some(app.selected + 1));
+        state.select(Some(selected_item));
     }
     f.render_stateful_widget(list, area, &mut state);
 }
