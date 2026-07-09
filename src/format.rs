@@ -203,7 +203,7 @@ mod tests {
                 if frac < 1.0 {
                     // Under 100% always leaves an eighth: either a visible gap or
                     // a partial (not fully solid) last block.
-                    let solid = empty.is_empty() && filled.chars().last() == Some('█');
+                    let solid = empty.is_empty() && filled.ends_with('█');
                     assert!(!solid, "under 100% never reads as full: w={w} pct={pct}");
                 }
             }
