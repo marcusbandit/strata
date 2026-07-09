@@ -257,6 +257,10 @@ impl App {
                 fresh.collapsed = std::mem::take(&mut self.collapsed);
                 fresh.config = std::mem::take(&mut self.config);
                 fresh.show_detail = self.show_detail;
+                // Preserve the view state too, so a manual R (or the refresh after
+                // a mount/eject) does not silently drop an active filter or sort.
+                fresh.filter = self.filter.take();
+                fresh.sort = self.sort;
                 fresh.rebuild_rows();
                 if let Some(name) = keep_name {
                     if let Some(i) = fresh.rows.iter().position(|r| r.name == name) {
@@ -774,6 +778,10 @@ impl App {
         };
         if !disk.hotplug {
             self.status = Some("eject is only for removable drives".into());
+            return;
+        }
+        if Self::disk_is_system(disk) {
+            self.status = Some("refusing to eject the drive holding the system root /".into());
             return;
         }
         let mut targets = Vec::new();
