@@ -6,7 +6,7 @@
 //! carries the depth so the overview itself stays uncluttered.
 
 use crate::app::{
-    App, DrillState, LabelState, Mode, MountAction, MountState, NameKind, RenameState,
+    App, DrillState, LabelState, Mode, MountAction, MountState, NameKind, RenameState, SortKey,
 };
 use crate::format::{self, fit, ACCENT, HEADER, MOUNT_W, MUTED, NAME_W, NICK};
 use crate::model::{Dev, Health};
@@ -247,6 +247,7 @@ fn handle_overview(app: &mut App, code: KeyCode) {
         KeyCode::Char('m') => app.begin_mount(),
         KeyCode::Char('y') => app.begin_yank(),
         KeyCode::Char('o') => open_mountpoint(app),
+        KeyCode::Char('s') => app.cycle_sort(),
         KeyCode::Char('d') => app.begin_drill(),
         KeyCode::Char('i') => app.toggle_detail(),
         KeyCode::Char('R') => app.refresh(),
@@ -449,10 +450,10 @@ fn draw_tree(f: &mut Frame, area: Rect, app: &App, verbose: bool) {
         items.push(ListItem::new(line));
     }
 
-    let title = if verbose {
-        " drives · i: show detail panel "
-    } else {
-        " drives "
+    let title = match app.sort {
+        SortKey::Tree if verbose => " drives · i: show detail panel ".to_string(),
+        SortKey::Tree => " drives ".to_string(),
+        other => format!(" drives · sort: {} ", other.label()),
     };
     let list = List::new(items)
         .block(
@@ -902,6 +903,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         help_row("j / k, ↑ ↓", "move selection"),
         help_row("/", "filter the tree (name, label, mount, nickname); esc clears"),
         help_row("g / G", "jump to top / bottom"),
+        help_row("s", "cycle sort: tree, size, used, name"),
         help_row("enter / space", "expand or collapse a drive"),
         help_row("r", "give the selected disk a nickname"),
         help_row("m", "mount, or unmount (asks first), the selected filesystem"),
@@ -1481,6 +1483,7 @@ mod tests {
             status: None,
             show_detail: true,
             filter: None,
+            sort: SortKey::Tree,
             should_quit: false,
         };
         app.rebuild_rows();

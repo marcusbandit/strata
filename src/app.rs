@@ -47,6 +47,38 @@ pub struct SearchState {
     pub input: String,
 }
 
+/// How the tree is ordered. `Tree` keeps the natural lsblk order; the others
+/// reorder disks (and each disk's partitions) for at-a-glance ranking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    Tree,
+    Size,
+    Used,
+    Name,
+}
+
+impl SortKey {
+    /// The next key in the cycle (wraps back to `Tree`).
+    pub fn next(self) -> SortKey {
+        match self {
+            SortKey::Tree => SortKey::Size,
+            SortKey::Size => SortKey::Used,
+            SortKey::Used => SortKey::Name,
+            SortKey::Name => SortKey::Tree,
+        }
+    }
+
+    /// A short label for the tree header / status line.
+    pub fn label(self) -> &'static str {
+        match self {
+            SortKey::Tree => "tree order",
+            SortKey::Size => "size (largest first)",
+            SortKey::Used => "used (fullest first)",
+            SortKey::Name => "name (A-Z)",
+        }
+    }
+}
+
 /// A little "copy which fact?" menu for the selected device. The facts are
 /// snapshotted on entry so the picker does not re-borrow the tree.
 pub struct YankState {
@@ -173,6 +205,8 @@ pub struct App {
     /// Active tree filter: only devices whose subtree matches are shown. `None`
     /// (or empty) means everything is visible.
     pub filter: Option<String>,
+    /// How the tree is ordered (disks, and each disk's partitions).
+    pub sort: SortKey,
     pub should_quit: bool,
 }
 
@@ -194,6 +228,7 @@ impl App {
             status: None,
             show_detail: true,
             filter: None,
+            sort: SortKey::Tree,
             should_quit: false,
         };
         app.rebuild_rows();
@@ -310,16 +345,74 @@ impl App {
     pub fn rebuild_rows(&mut self) {
         let filter = self.filter.clone().filter(|q| !q.is_empty());
         let mut rows = Vec::new();
-        for (i, drive) in self.snapshot.drives.iter().enumerate() {
+        for real_i in self.ordered_indices(&self.snapshot.drives) {
+            let drive = &self.snapshot.drives[real_i];
             match &filter {
-                Some(q) => self.flatten_filtered(drive, vec![i], 0, q, &mut rows),
-                None => flatten(drive, vec![i], 0, &self.collapsed, &mut rows),
+                Some(q) => self.flatten_filtered(drive, vec![real_i], 0, q, &mut rows),
+                None => self.flatten(drive, vec![real_i], 0, &mut rows),
             }
         }
         self.rows = rows;
         if self.selected >= self.rows.len() {
             self.selected = self.rows.len().saturating_sub(1);
         }
+    }
+
+    /// Child indices of `devs` in display order under the current sort. Returns
+    /// real indices (into `devs`) so a [`Row`]'s `path` still resolves via
+    /// [`dev_at`]; only the *order* changes, never the snapshot. Stable, so ties
+    /// keep their natural lsblk order.
+    fn ordered_indices(&self, devs: &[Dev]) -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..devs.len()).collect();
+        match self.sort {
+            SortKey::Tree => {}
+            SortKey::Size => idx.sort_by(|&a, &b| devs[b].size.cmp(&devs[a].size)),
+            SortKey::Used => idx.sort_by(|&a, &b| {
+                let ua = devs[a].used_fraction().unwrap_or(-1.0);
+                let ub = devs[b].used_fraction().unwrap_or(-1.0);
+                ub.partial_cmp(&ua).unwrap_or(std::cmp::Ordering::Equal)
+            }),
+            SortKey::Name => idx.sort_by(|&a, &b| {
+                self.display_name(&devs[a])
+                    .to_ascii_lowercase()
+                    .cmp(&self.display_name(&devs[b]).to_ascii_lowercase())
+            }),
+        }
+        idx
+    }
+
+    /// Recursively append a device and its (non-collapsed) descendants as rows,
+    /// each level ordered by the current sort.
+    fn flatten(&self, dev: &Dev, path: Vec<usize>, depth: usize, out: &mut Vec<Row>) {
+        let has_children = !dev.children.is_empty();
+        out.push(Row {
+            path: path.clone(),
+            depth,
+            name: dev.name.clone(),
+            is_disk: dev.is_disk(),
+            has_children,
+        });
+        if has_children && !self.collapsed.contains(&dev.name) {
+            for real_i in self.ordered_indices(&dev.children) {
+                let mut child_path = path.clone();
+                child_path.push(real_i);
+                self.flatten(&dev.children[real_i], child_path, depth + 1, out);
+            }
+        }
+    }
+
+    /// Cycle to the next sort order and rebuild, keeping the cursor on the same
+    /// device.
+    pub fn cycle_sort(&mut self) {
+        let keep = self.selected_row().map(|r| r.name.clone());
+        self.sort = self.sort.next();
+        self.rebuild_rows();
+        if let Some(name) = keep {
+            if let Some(i) = self.rows.iter().position(|r| r.name == name) {
+                self.selected = i;
+            }
+        }
+        self.status = Some(format!("sorted by {}", self.sort.label()));
     }
 
     /// Like [`flatten`] but keeps only devices whose subtree matches `q`, and
@@ -337,10 +430,10 @@ impl App {
             is_disk: dev.is_disk(),
             has_children: visible_child,
         });
-        for (i, child) in dev.children.iter().enumerate() {
+        for real_i in self.ordered_indices(&dev.children) {
             let mut child_path = path.clone();
-            child_path.push(i);
-            self.flatten_filtered(child, child_path, depth + 1, q, out);
+            child_path.push(real_i);
+            self.flatten_filtered(&dev.children[real_i], child_path, depth + 1, q, out);
         }
     }
 
@@ -740,31 +833,6 @@ impl App {
     }
 }
 
-/// Recursively append a device and its (non-collapsed) descendants as rows.
-fn flatten(
-    dev: &Dev,
-    path: Vec<usize>,
-    depth: usize,
-    collapsed: &HashSet<String>,
-    out: &mut Vec<Row>,
-) {
-    let has_children = !dev.children.is_empty();
-    out.push(Row {
-        path: path.clone(),
-        depth,
-        name: dev.name.clone(),
-        is_disk: dev.is_disk(),
-        has_children,
-    });
-    if has_children && !collapsed.contains(&dev.name) {
-        for (i, child) in dev.children.iter().enumerate() {
-            let mut child_path = path.clone();
-            child_path.push(i);
-            flatten(child, child_path, depth + 1, collapsed, out);
-        }
-    }
-}
-
 /// Spawn a background thread to scan `dir`'s largest children, returning the
 /// channel its result will arrive on. The walk can take seconds on a huge tree,
 /// so it must never block the render loop.
@@ -837,6 +905,7 @@ mod tests {
             status: None,
             show_detail: true,
             filter: None,
+            sort: SortKey::Tree,
             should_quit: false,
         };
         app.rebuild_rows();
@@ -881,6 +950,29 @@ mod tests {
         app.filter = Some("zzz".to_string());
         app.rebuild_rows();
         assert!(app.rows.is_empty());
+    }
+
+    #[test]
+    fn sort_by_size_reorders_but_paths_still_resolve() {
+        let sized = |name: &str, size: u64| Dev {
+            name: name.to_string(),
+            kind: "disk".to_string(),
+            size,
+            ..Default::default()
+        };
+        let mut app = app_with(vec![sized("sda", 100), sized("sdb", 300), sized("sdc", 200)]);
+        app.sort = SortKey::Size;
+        app.rebuild_rows();
+        // Largest first.
+        let names: Vec<&str> = app.rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["sdb", "sdc", "sda"]);
+        // The reordered row's path still points at the right device.
+        assert_eq!(app.dev_at(&app.rows[0].path).unwrap().name, "sdb");
+        // Cycling all the way round returns to natural order.
+        app.sort = SortKey::Tree;
+        app.rebuild_rows();
+        let natural: Vec<&str> = app.rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(natural, vec!["sda", "sdb", "sdc"]);
     }
 
     #[test]
