@@ -107,6 +107,7 @@ fn handle_overview(app: &mut App, code: KeyCode) {
         KeyCode::Char('r') => app.begin_rename(),
         KeyCode::Char('L') => app.begin_label(),
         KeyCode::Char('d') => app.begin_drill(),
+        KeyCode::Char('i') => app.toggle_detail(),
         KeyCode::Char('R') => app.refresh(),
         KeyCode::Char('?') => app.mode = Mode::Help,
         _ => {}
@@ -224,33 +225,43 @@ fn draw_title(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_overview(f: &mut Frame, area: Rect, app: &App) {
-    let cols = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).split(area);
-    draw_tree(f, cols[0], app);
-    draw_detail(f, cols[1], app);
+    if app.show_detail {
+        let cols = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).split(area);
+        draw_tree(f, cols[0], app, false);
+        draw_detail(f, cols[1], app);
+    } else {
+        // Detail hidden: the tree takes the full width and shows extra columns.
+        draw_tree(f, area, app, true);
+    }
 }
 
-fn draw_tree(f: &mut Frame, area: Rect, app: &App) {
+fn draw_tree(f: &mut Frame, area: Rect, app: &App, verbose: bool) {
     let items: Vec<ListItem> = app
         .rows
         .iter()
         .map(|row| {
             let dev = app.dev_at(&row.path);
             let line = match dev {
-                Some(d) if row.is_disk => disk_line(app, d, &app.collapsed_marker(row)),
-                Some(d) => part_line(app, d, row.depth),
+                Some(d) if row.is_disk => disk_line(app, d, &app.collapsed_marker(row), verbose),
+                Some(d) => part_line(app, d, row.depth, verbose),
                 None => Line::from("?"),
             };
             ListItem::new(line)
         })
         .collect();
 
+    let title = if verbose {
+        " drives · i: show detail panel "
+    } else {
+        " drives "
+    };
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(MUTED))
-                .title(Span::styled(" drives ", Style::default().fg(ACCENT))),
+                .title(Span::styled(title, Style::default().fg(ACCENT))),
         )
         .highlight_style(Style::default().bg(HILITE_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("▌ ");
@@ -263,12 +274,11 @@ fn draw_tree(f: &mut Frame, area: Rect, app: &App) {
 }
 
 // Fixed column widths, so every row lines up into a scannable grid. Disk and
-// partition rows share the same 4-column prefix and 16-wide name column, so
-// their names align; from there each row type has its own aligned columns.
-const NAME_W: usize = 16;
-const MODEL_W: usize = 20;
-const FS_W: usize = 6;
-const BAR_W: usize = 12;
+// partition rows share the same 4-column prefix and same-width name column, so
+// their headline names align; from there each row type has its own columns.
+const NAME_W: usize = 15;
+const MOUNT_W: usize = 14;
+const MODEL_W: usize = 22;
 
 fn fg(color: Color) -> Style {
     Style::default().fg(color)
@@ -287,31 +297,44 @@ fn fit(s: &str, w: usize) -> String {
     }
 }
 
-/// The header line for a physical disk: `▾  disk  MODEL  SIZE  tag  temp  ●`.
-fn disk_line(app: &App, dev: &Dev, marker: &str) -> Line<'static> {
-    // Prefix is 4 columns (marker "▾ " + glyph + space), matching part rows.
+/// The header line for a physical disk. Leads with the disk's name and a
+/// `system` badge when it holds `/`, so the OS drive is obvious at a glance.
+/// The long model string only appears in verbose (detail-panel-hidden) mode.
+fn disk_line(app: &App, dev: &Dev, marker: &str, verbose: bool) -> Line<'static> {
     let (temp_txt, temp_color) = match dev.temp_c {
         Some(t) => (format!("{t:.0}°C"), format::temp_color(t)),
         None => (String::new(), MUTED),
     };
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(marker.to_string(), fg(MUTED)),
         Span::styled(format!("{} ", format::medium_glyph(dev.medium())), fg(ACCENT)),
-        Span::styled(fit(&app.display_name(dev), NAME_W), Style::default().fg(HEADER).add_modifier(Modifier::BOLD)),
-        Span::styled(fit(dev.model.as_deref().unwrap_or("-"), MODEL_W), fg(MUTED)),
-        Span::styled(format!("{:>6}", format::human_bytes(dev.size)), fg(Color::Gray)),
-        Span::styled(format!("  {}", fit(format::medium_tag(dev.medium()), 4)), fg(MUTED)),
-        Span::styled(format!("  {temp_txt:>5}"), fg(temp_color)),
-        Span::raw("  "),
-        health_dot(dev.health.as_ref()),
-    ])
+        Span::styled(fit(&app.disk_display(dev), NAME_W), Style::default().fg(HEADER).add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+    ];
+    if verbose {
+        spans.push(Span::styled(fit(dev.model.as_deref().unwrap_or("-"), MODEL_W), fg(MUTED)));
+        spans.push(Span::raw(" "));
+    }
+    if App::disk_is_system(dev) {
+        spans.push(Span::styled(fit("system", 8), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
+    } else {
+        spans.push(Span::raw(" ".repeat(8)));
+    }
+    spans.push(Span::styled(fit(format::medium_tag(dev.medium()), 5), fg(MUTED)));
+    spans.push(Span::styled(format!("{:>6}", format::human_bytes(dev.size)), fg(Color::Gray)));
+    spans.push(Span::styled(format!("  {temp_txt:>5}"), fg(temp_color)));
+    spans.push(Span::raw("  "));
+    spans.push(health_dot(dev.health.as_ref()));
+    Line::from(spans)
 }
 
-/// A filesystem row: `● NAME  fs  ██████░░░░  NN%   used / size`, with the bar,
-/// percentage, and used/size columns aligned across every partition. Indent
-/// scales with tree depth (for nested LUKS/LVM devices) but is absorbed into the
-/// name column so the columns after it stay put.
-fn part_line(app: &App, dev: &Dev, depth: usize) -> Line<'static> {
+/// A filesystem row: `● NAME  MOUNT  ██████░░  NN%  used / size`.
+///
+/// NAME is the headline (nickname or filesystem label, bright; a dim device-id
+/// when neither is set). MOUNT is its own column so you can see where each lives,
+/// and the root `/` is drawn in bold accent with a home glyph so it is
+/// unmistakable. Verbose mode inserts the filesystem type and device id.
+fn part_line(app: &App, dev: &Dev, depth: usize, verbose: bool) -> Line<'static> {
     let extra = 2 * depth.saturating_sub(1);
     let name_w = NAME_W.saturating_sub(extra);
 
@@ -323,29 +346,45 @@ fn part_line(app: &App, dev: &Dev, depth: usize) -> Line<'static> {
         spans.push(Span::styled("○ ", fg(MUTED)));
     }
 
-    let name_style = if dev.is_mounted() { fg(HEADER) } else { fg(MUTED) };
-    spans.push(Span::styled(fit(&app.display_name(dev), name_w), name_style));
-    spans.push(Span::styled(fit(dev.fstype.as_deref().unwrap_or("-"), FS_W), fg(MUTED)));
+    // Headline: a real name (nickname/label) is bright; a device-id fallback is
+    // dimmed so labels read as more important.
+    let (label, named) = app.partition_label(dev);
+    let name_style = if named { fg(HEADER) } else { fg(MUTED) };
+    spans.push(Span::styled(fit(&label, name_w), name_style));
     spans.push(Span::raw(" "));
 
+    match dev.primary_mount() {
+        Some("/") => spans.push(Span::styled(
+            fit("\u{f015} / root", MOUNT_W),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        Some(mp) => spans.push(Span::styled(fit(mp, MOUNT_W), fg(HEADER))),
+        None => spans.push(Span::styled(fit("unmounted", MOUNT_W), fg(MUTED))),
+    }
+    spans.push(Span::raw(" "));
+
+    if verbose {
+        spans.push(Span::styled(fit(dev.fstype.as_deref().unwrap_or("-"), 6), fg(MUTED)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(fit(&dev.name, 12), fg(MUTED)));
+        spans.push(Span::raw(" "));
+    }
+
+    let bar_w = if verbose { 16 } else { 10 };
     match (dev.is_mounted(), dev.used_fraction()) {
         (true, Some(frac)) => {
-            spans.extend(bar_spans(frac, BAR_W));
+            spans.extend(bar_spans(frac, bar_w));
             spans.push(Span::styled(format!(" {:>3.0}%", frac * 100.0), fg(format::usage_color(frac))));
-            let usage = match (dev.fsused, dev.fssize) {
-                (Some(u), Some(s)) => format!("  {:>5} / {:>6}", format::human_bytes(u), format::human_bytes(s)),
-                _ => String::new(),
-            };
-            spans.push(Span::styled(usage, fg(MUTED)));
+            if let (Some(u), Some(s)) = (dev.fsused, dev.fssize) {
+                spans.push(Span::styled(
+                    format!("  {:>5} / {:>5}", format::human_bytes(u), format::human_bytes(s)),
+                    fg(MUTED),
+                ));
+            }
         }
-        (true, None) => {
-            spans.push(Span::styled(" ".repeat(BAR_W), fg(MUTED)));
-            spans.push(Span::styled("    ?  mounted", fg(MUTED)));
-        }
-        (false, _) => {
-            // Keep the size in the same column as mounted rows' size.
-            spans.push(Span::styled(" ".repeat(BAR_W), fg(MUTED)));
-            spans.push(Span::styled(format!("      {:>6}  not mounted", format::human_bytes(dev.size)), fg(MUTED)));
+        _ => {
+            spans.push(Span::styled(" ".repeat(bar_w), fg(MUTED)));
+            spans.push(Span::styled(format!("       {:>5}", format::human_bytes(dev.size)), fg(MUTED)));
         }
     }
     Line::from(spans)
@@ -425,10 +464,20 @@ fn detail_disk(dev: &Dev) -> Text<'static> {
 }
 
 fn detail_part(app: &App, dev: &Dev) -> Text<'static> {
-    let mut lines = vec![Line::from(Span::styled(
-        app.display_name(dev),
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-    ))];
+    let (label, _) = app.partition_label(dev);
+    // Headline, then a line spelling out what that headline actually is (a
+    // nickname, a filesystem label, or just the device name).
+    let mut lines = vec![
+        Line::from(Span::styled(label, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(format!("({})", app.name_kind(dev)), Style::default().fg(MUTED))),
+    ];
+    if dev.is_root() {
+        lines.push(Line::from(Span::styled(
+            "◆ this is your system root  /",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines.push(Line::raw(""));
 
     // Plain-language "what is this filesystem" blurb.
     if let Some(fs) = &dev.fstype {
@@ -513,7 +562,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         Mode::Rename(_) => " type a nickname · enter save · esc cancel",
         Mode::Label(_) => " type a label · enter preview command · esc cancel",
         Mode::Help => " any key to close",
-        Mode::Overview => " j/k move · enter expand · r name · L label · d drill · R refresh · ? help · q quit",
+        Mode::Overview => " j/k move · enter expand · r name · L label · d drill · i panel · ? help · q quit",
     };
     f.render_widget(Paragraph::new(Line::from(Span::styled(hints, Style::default().fg(MUTED)))), area);
 }
@@ -592,12 +641,17 @@ fn draw_help(f: &mut Frame, area: Rect) {
         help_row("r", "give the selected disk a nickname"),
         help_row("L", "set the real filesystem label (shows the command)"),
         help_row("d", "drill into what is using the space"),
+        help_row("i", "show/hide the detail panel (more columns)"),
         help_row("R", "re-read all disks"),
         help_row("? ", "this help"),
         help_row("q / esc", "quit"),
         Line::raw(""),
         Line::from(Span::styled(
-            "nicknames are saved to ~/.config/strata/config.toml",
+            "A row's headline is your nickname, else the filesystem label,",
+            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+        )),
+        Line::from(Span::styled(
+            "else the device name. The MOUNT column shows where it lives; / is root.",
             Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
         )),
     ];
@@ -773,6 +827,7 @@ mod tests {
             collapsed: HashSet::new(),
             mode: Mode::Overview,
             status: None,
+            show_detail: true,
             should_quit: false,
         };
         app.rebuild_rows();
@@ -791,8 +846,10 @@ mod tests {
         assert!(text.contains("strata"), "title");
         assert!(text.contains("drives"), "tree pane");
         assert!(text.contains("details"), "detail pane");
-        assert!(text.contains("WD_BLACK"), "drive model");
-        assert!(text.contains("btrfs"), "filesystem shown");
+        assert!(text.contains("nvme0n1"), "disk headline");
+        assert!(text.contains("system"), "system-disk badge (holds root)");
+        assert!(text.contains("root"), "root mount highlighted");
+        assert!(text.contains("WD_BLACK"), "model shown in detail panel");
         assert!(text.contains('█'), "a usage bar is drawn");
     }
 
@@ -802,9 +859,13 @@ mod tests {
     #[test]
     #[ignore]
     fn render_real_system() {
-        let app = App::load().unwrap();
-        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let mut app = App::load().unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, 22)).unwrap();
         term.draw(|f| draw(f, &app)).unwrap();
-        eprintln!("\n{}", term.backend());
+        eprintln!("\n=== compact (detail panel) ===\n{}", term.backend());
+
+        app.show_detail = false;
+        term.draw(|f| draw(f, &app)).unwrap();
+        eprintln!("\n=== verbose (detail hidden, full width) ===\n{}", term.backend());
     }
 }

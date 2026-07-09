@@ -83,6 +83,9 @@ pub struct App {
     pub mode: Mode,
     /// Transient one-line message (saved, error, hint).
     pub status: Option<String>,
+    /// Whether the right-hand detail panel is shown. Hiding it gives the tree
+    /// the full width and turns on the extra columns (device id, fs, bytes).
+    pub show_detail: bool,
     pub should_quit: bool,
 }
 
@@ -102,6 +105,7 @@ impl App {
             collapsed: HashSet::new(),
             mode: Mode::Overview,
             status: None,
+            show_detail: true,
             should_quit: false,
         };
         app.rebuild_rows();
@@ -116,6 +120,7 @@ impl App {
             Ok(mut fresh) => {
                 fresh.collapsed = std::mem::take(&mut self.collapsed);
                 fresh.config = std::mem::take(&mut self.config);
+                fresh.show_detail = self.show_detail;
                 fresh.rebuild_rows();
                 if let Some(name) = keep_name {
                     if let Some(i) = fresh.rows.iter().position(|r| r.name == name) {
@@ -213,6 +218,51 @@ impl App {
         dev.uuid
             .clone()
             .or_else(|| if dev.is_disk() { dev.serial.clone() } else { None })
+    }
+
+    /// Toggle the detail panel (and, with it, the tree's compact/verbose density).
+    pub fn toggle_detail(&mut self) {
+        self.show_detail = !self.show_detail;
+    }
+
+    /// The nickname the user set for a device, if any.
+    fn nickname(&self, dev: &Dev) -> Option<String> {
+        Self::alias_key(dev).and_then(|k| self.config.alias(&k)).and_then(|a| a.nickname.clone())
+    }
+
+    /// The human name of a filesystem and whether it is a *real* name (a
+    /// nickname or filesystem label) as opposed to a bare device-id fallback.
+    /// The bool lets the UI dim the fallback so a label reads as more important.
+    pub fn partition_label(&self, dev: &Dev) -> (String, bool) {
+        if let Some(nick) = self.nickname(dev) {
+            return (nick, true);
+        }
+        if let Some(label) = &dev.label {
+            return (label.clone(), true);
+        }
+        (dev.name.clone(), false)
+    }
+
+    /// A disk's headline: the user's nickname if set, else the device name.
+    pub fn disk_display(&self, dev: &Dev) -> String {
+        self.nickname(dev).unwrap_or_else(|| dev.name.clone())
+    }
+
+    /// Whether this disk holds the system root `/` (anywhere in its subtree).
+    pub fn disk_is_system(dev: &Dev) -> bool {
+        dev.is_root() || dev.children.iter().any(Self::disk_is_system)
+    }
+
+    /// What kind of name `partition_label` returned, for the detail panel to
+    /// spell out ("this is a filesystem label", etc.).
+    pub fn name_kind(&self, dev: &Dev) -> &'static str {
+        if self.nickname(dev).is_some() {
+            "your nickname"
+        } else if dev.label.is_some() {
+            "filesystem label"
+        } else {
+            "device name (no label set)"
+        }
     }
 
     /// The name to show for a device: the user's nickname if set, else the real
@@ -507,6 +557,7 @@ mod tests {
             collapsed: HashSet::new(),
             mode: Mode::Overview,
             status: None,
+            show_detail: true,
             should_quit: false,
         };
         app.rebuild_rows();

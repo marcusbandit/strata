@@ -12,7 +12,10 @@ main view never gets noisy.
 ## What it shows
 
 - **Physical-drive tree.** Partitions grouped under the disk they live on (not a
-  flat list), with a usage bar and percentage per mounted filesystem.
+  flat list), with a usage bar and percentage per mounted filesystem. Each row's
+  headline is its name (your nickname, else the filesystem label); a separate
+  MOUNT column shows where it lives. The system root `/` and the disk that holds
+  it are badged so they are obvious at a glance.
 - **Health and temperature.** SMART verdict and live temperature per drive.
   Temperatures come from sysfs and need no privileges; the SMART verdict needs
   root, and degrades to a clear "needs root" rather than failing.
@@ -42,6 +45,7 @@ main view never gets noisy.
 | `r` | give the selected disk a nickname |
 | `L` | set the real filesystem label (shows the command) |
 | `d` | drill into what is using the space |
+| `i` | show/hide the detail panel (full-width tree with extra columns) |
 | `R` | re-read all disks |
 | `?` | help |
 | `q` / `esc` | quit |

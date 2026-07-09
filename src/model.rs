@@ -58,9 +58,21 @@ impl Dev {
         self.kind == "disk"
     }
 
-    /// First real mountpoint, ignoring lsblk's null entries.
+    /// The most meaningful mountpoint. A btrfs filesystem is mounted at many
+    /// points at once (its subvolumes: `/`, `/home`, `/var/log`, ...), and
+    /// lsblk lists them in an arbitrary order, so we prefer `/` when present and
+    /// otherwise the shortest (most top-level) path. Without this, the root
+    /// filesystem can masquerade as `/var/log`.
     pub fn primary_mount(&self) -> Option<&str> {
-        self.mountpoints.iter().map(String::as_str).next()
+        if self.is_root() {
+            return Some("/");
+        }
+        self.mountpoints.iter().min_by_key(|m| m.len()).map(String::as_str)
+    }
+
+    /// Whether this filesystem is mounted as the system root `/`.
+    pub fn is_root(&self) -> bool {
+        self.mountpoints.iter().any(|m| m == "/")
     }
 
     pub fn is_mounted(&self) -> bool {
