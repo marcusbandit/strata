@@ -2,4 +2,5 @@
 
 pub mod health;
 pub mod lsblk;
+pub mod mounts;
 pub mod space;

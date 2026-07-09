@@ -192,6 +192,11 @@ pub fn label_command(
 /// Runs `plan.program` with `plan.args` directly; it does NOT escalate with
 /// sudo (the UI decides how to elevate). Returns an error on spawn failure or a
 /// non-zero exit, with the tool's stderr attached for context.
+///
+/// Reserved for an opt-in "run it for me" flow: today the UI shows the user the
+/// exact command instead of executing it (real relabels need root, and NTFS
+/// needs an unmount), so this executor is not yet on a live code path.
+#[allow(dead_code)]
 pub fn run_label(plan: &LabelPlan) -> Result<()> {
     let out = std::process::Command::new(&plan.program)
         .args(&plan.args)

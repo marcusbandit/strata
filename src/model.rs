@@ -100,20 +100,3 @@ pub enum Medium {
 pub struct Snapshot {
     pub drives: Vec<Dev>,
 }
-
-impl Snapshot {
-    /// Iterate every device node in the tree, depth-first.
-    pub fn walk(&self) -> impl Iterator<Item = &Dev> {
-        fn rec<'a>(d: &'a Dev, out: &mut Vec<&'a Dev>) {
-            out.push(d);
-            for c in &d.children {
-                rec(c, out);
-            }
-        }
-        let mut out = Vec::new();
-        for d in &self.drives {
-            rec(d, &mut out);
-        }
-        out.into_iter()
-    }
-}
