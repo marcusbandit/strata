@@ -37,6 +37,8 @@ current as files move without you pressing anything.
   system root `/`. It uses the desktop path (`udisksctl`, no password) first,
   then falls back to `mount`/`umount` escalated as far as needed (direct, then
   `sudo` on the terminal, then a `pkexec` popup).
+- **Eject (`e`).** For a removable drive: unmount its filesystems and power it
+  down so it is safe to unplug (asks first).
 - **Open (`o`).** Open the selected mountpoint in your file manager.
 - **Copy a fact (`y`).** Put the device path, name, mountpoint, label, or UUID on
   the clipboard.
@@ -76,6 +78,7 @@ current as files move without you pressing anything.
 | `r` | nickname the selected device |
 | `N` | attach a note |
 | `m` | mount, or unmount (asks first) |
+| `e` | eject (power off) a removable drive (asks first) |
 | `o` | open the mountpoint in your file manager |
 | `y` | copy a fact (path / uuid / mount / label) |
 | `L` | set the real filesystem label (with a dependency scan) |

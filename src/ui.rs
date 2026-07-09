@@ -248,6 +248,7 @@ fn handle_overview(app: &mut App, code: KeyCode) {
         KeyCode::Char('N') => app.begin_note(),
         KeyCode::Char('L') => app.begin_label(),
         KeyCode::Char('m') => app.begin_mount(),
+        KeyCode::Char('e') => app.begin_eject(),
         KeyCode::Char('y') => app.begin_yank(),
         KeyCode::Char('o') => open_mountpoint(app),
         KeyCode::Char('s') => app.cycle_sort(),
@@ -939,6 +940,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         help_row("r", "give the selected disk a nickname"),
         help_row("N", "attach a free-text note to the selected device"),
         help_row("m", "mount, or unmount (asks first), the selected filesystem"),
+        help_row("e", "eject (power off) a removable drive, asks first"),
         help_row("o", "open the mountpoint in your file manager"),
         help_row("y", "copy a fact (path, uuid, mount, label) to the clipboard"),
         help_row("L", "set the real on-disk label (applies it, asks for sudo)"),
@@ -1167,6 +1169,28 @@ fn draw_mount(f: &mut Frame, area: Rect, state: &MountState) {
                     Span::styled(": cancel", fg(MUTED)),
                 ]));
             }
+            // Eject: unmount everything and power the drive down.
+            MountAction::Eject => {
+                lines.push(Line::from(vec![
+                    Span::styled("Eject ", fg(HEADER)),
+                    Span::styled(state.name.clone(), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                    Span::styled(" ?", fg(HEADER)),
+                ]));
+                lines.push(Line::raw(""));
+                let n = state.targets.len();
+                let what = if n == 1 { "1 filesystem".to_string() } else { format!("{n} filesystems") };
+                lines.push(Line::from(Span::styled(
+                    format!("Unmounts {what} and powers the drive down; safe to unplug after."),
+                    Style::default().fg(amber),
+                )));
+                lines.push(Line::raw(""));
+                lines.push(Line::from(vec![
+                    Span::styled("y", Style::default().fg(sage).add_modifier(Modifier::BOLD)),
+                    Span::styled(": yes, eject       ", fg(MUTED)),
+                    Span::styled("n / esc", fg(HEADER)),
+                    Span::styled(": cancel", fg(MUTED)),
+                ]));
+            }
             // Mount is armed already; this frame just shows while it runs.
             MountAction::Mount => {
                 lines.push(Line::from(vec![
@@ -1181,6 +1205,7 @@ fn draw_mount(f: &mut Frame, area: Rect, state: &MountState) {
     let title = match state.action {
         MountAction::Unmount => " unmount ",
         MountAction::Mount => " mount ",
+        MountAction::Eject => " eject ",
     };
     let popup = centered(area, 66, 40);
     f.render_widget(Clear, popup);
@@ -1400,15 +1425,16 @@ fn shell_quote(s: &str) -> String {
 /// If the user armed a mount/unmount, run it (with terminal access for sudo)
 /// and record the outcome on the mount state.
 fn maybe_apply_mount(term: &mut Term, app: &mut App) {
-    let (path, mp, action) = match &app.mode {
+    let (path, mp, action, targets) = match &app.mode {
         Mode::Mount(s) if s.confirmed && s.outcome.is_none() => {
-            (s.device_path.clone(), s.mountpoint.clone(), s.action)
+            (s.device_path.clone(), s.mountpoint.clone(), s.action, s.targets.clone())
         }
         _ => return,
     };
     let outcome = match action {
         MountAction::Mount => apply_mount(term, &path),
         MountAction::Unmount => apply_unmount(term, &path, mp.as_deref()),
+        MountAction::Eject => apply_eject(term, &path, &targets),
     };
     if let Mode::Mount(s) = &mut app.mode {
         s.outcome = Some(outcome);
@@ -1473,6 +1499,34 @@ fn apply_unmount(term: &mut Term, path: &str, mp: Option<&str>) -> Result<String
     Err(format!(
         "could not unmount it ({}). Something may still be using it.",
         one_line(&first_err, "target is busy")
+    ))
+}
+
+/// Eject a removable disk: unmount each of its filesystems (no-root path), then
+/// power it down so it is safe to unplug, falling back to `eject(1)` escalated.
+fn apply_eject(term: &mut Term, disk_path: &str, targets: &[String]) -> Result<String, String> {
+    for t in targets {
+        let _ = run_out("udisksctl", &["unmount", "-b", t]);
+    }
+    let (ok, _out, err) = run_out("udisksctl", &["power-off", "-b", disk_path]);
+    if ok {
+        return Ok("ejected, safe to unplug".into());
+    }
+    let cmd = format!("eject {}", shell_quote(disk_path));
+    if run_captured("sh", &["-c", &cmd]).0 {
+        return Ok("ejected, safe to unplug".into());
+    }
+    if let Some(true) = run_suspended(
+        term,
+        "sudo",
+        &["sh", "-c", &cmd],
+        "Ejecting needs root. Authenticate for sudo below:",
+    ) {
+        return Ok("ejected (via sudo), safe to unplug".into());
+    }
+    Err(format!(
+        "could not eject it ({}). Unmount its filesystems (m) and retry.",
+        one_line(&err, "device is busy")
     ))
 }
 

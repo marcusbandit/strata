@@ -90,11 +90,13 @@ pub struct YankState {
     pub label: Option<String>,
 }
 
-/// Whether a [`MountState`] is about to mount or unmount its device.
+/// What a [`MountState`] is about to do to its device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MountAction {
     Mount,
     Unmount,
+    /// Unmount everything on a removable disk and power it down for unplugging.
+    Eject,
 }
 
 /// Mount/unmount flow. Mounting is armed immediately (it is safe); unmounting
@@ -108,8 +110,11 @@ pub struct MountState {
     pub mountpoint: Option<String>,
     pub action: MountAction,
     /// Set once the operation is armed; the event loop then runs it. Mounting
-    /// arms on entry; unmounting arms only after the user confirms.
+    /// arms on entry; unmounting and ejecting arm only after the user confirms.
     pub confirmed: bool,
+    /// For `Eject`: the device paths of the disk's mounted filesystems, unmounted
+    /// before it is powered off. Empty for mount/unmount.
+    pub targets: Vec<String>,
     /// Result of the attempt: `Ok(msg)` / `Err(msg)`, or `None` while pending.
     pub outcome: Option<Result<String, String>>,
 }
@@ -753,6 +758,34 @@ impl App {
             action,
             // Mounting is safe, so arm it now; unmounting waits for a yes.
             confirmed: action == MountAction::Mount,
+            targets: Vec::new(),
+            outcome: None,
+        });
+    }
+
+    /// Begin ejecting (powering off) the removable disk the selection lives on,
+    /// behind a confirmation. Only offered for hotplug drives.
+    pub fn begin_eject(&mut self) {
+        let Some(disk_idx) = self.selected_row().and_then(|r| r.path.first().copied()) else {
+            return;
+        };
+        let Some(disk) = self.snapshot.drives.get(disk_idx) else {
+            return;
+        };
+        if !disk.hotplug {
+            self.status = Some("eject is only for removable drives".into());
+            return;
+        }
+        let mut targets = Vec::new();
+        collect_mounted(disk, &mut targets);
+        let name = self.disk_name(disk).0;
+        self.mode = Mode::Mount(MountState {
+            device_path: disk.path.clone(),
+            name,
+            mountpoint: None,
+            action: MountAction::Eject,
+            confirmed: false,
+            targets,
             outcome: None,
         });
     }
@@ -898,6 +931,17 @@ impl App {
             let last = state.entries.len() as isize - 1;
             state.selected = (state.selected as isize + delta).clamp(0, last) as usize;
         }
+    }
+}
+
+/// Collect the device paths of every mounted filesystem in `dev`'s subtree, for
+/// unmounting before an eject.
+fn collect_mounted(dev: &Dev, out: &mut Vec<String>) {
+    if dev.is_mounted() {
+        out.push(dev.path.clone());
+    }
+    for child in &dev.children {
+        collect_mounted(child, out);
     }
 }
 
