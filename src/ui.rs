@@ -5,8 +5,8 @@
 //! master-detail: a drive tree on the left, a detail panel on the right that
 //! carries the depth so the overview itself stays uncluttered.
 
-use crate::app::{App, DrillState, LabelState, Mode, RenameState};
-use crate::format;
+use crate::app::{App, DrillState, LabelState, Mode, NameKind, RenameState};
+use crate::format::{self, fit, ACCENT, HEADER, MOUNT_W, MUTED, NAME_W, NICK};
 use crate::model::{Dev, Health};
 use crate::naming;
 use ratatui::backend::CrosstermBackend;
@@ -21,15 +21,25 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::io::{self, Stdout, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
-// A small, consistent palette so the whole UI reads as one surface.
-const ACCENT: Color = Color::Rgb(0x8f, 0xbc, 0xbb); // teal
-const MUTED: Color = Color::Rgb(0x74, 0x78, 0x88);
+// The shared palette (ACCENT/MUTED/HEADER/NICK) lives in `format` so the TUI and
+// the plain renderer stay in lockstep; only this TUI-only selection background
+// is declared here.
 const HILITE_BG: Color = Color::Rgb(0x2e, 0x34, 0x40);
-const HEADER: Color = Color::Rgb(0xd8, 0xde, 0xe9);
+
+/// The palette color for a device name of a given [`NameKind`]: a nickname is
+/// the distinct mauve, a real filesystem label is bright, a device-id fallback
+/// is dimmed so labels read as more important.
+fn name_color(kind: NameKind) -> Color {
+    match kind {
+        NameKind::Nickname => NICK,
+        NameKind::Label => HEADER,
+        NameKind::DeviceId => MUTED,
+    }
+}
 
 /// Set up the terminal, run the event loop, and always restore on the way out.
 pub fn run(mut app: App) -> anyhow::Result<()> {
@@ -66,6 +76,11 @@ fn install_panic_hook() {
 }
 
 fn event_loop(term: &mut Term, app: &mut App) -> anyhow::Result<()> {
+    // The overview updates itself: every couple of seconds we re-read the fast,
+    // volatile facts (usage as files move, temperatures as they drift) so the
+    // screen stays live without the user pressing R.
+    const LIVE_REFRESH: Duration = Duration::from_secs(2);
+    let mut last_refresh = Instant::now();
     loop {
         term.draw(|f| draw(f, app))?;
         // Poll rather than block so background drill scans surface promptly.
@@ -80,6 +95,14 @@ fn event_loop(term: &mut Term, app: &mut App) -> anyhow::Result<()> {
         // runs here in the loop rather than inside a plain App method.
         maybe_apply_label(term, app);
         app.poll_drill();
+        // Auto-refresh only from the calm overview, so it never yanks the tree
+        // out from under a rename, a label confirm, a drill scan, or help.
+        if last_refresh.elapsed() >= LIVE_REFRESH {
+            if matches!(app.mode, Mode::Overview) {
+                app.live_refresh();
+            }
+            last_refresh = Instant::now();
+        }
         if app.should_quit {
             return Ok(());
         }
@@ -321,28 +344,12 @@ fn column_header(verbose: bool) -> ListItem<'static> {
     )))
 }
 
-// Fixed column widths, so every row lines up into a scannable grid. Disk and
-// partition rows share the same 4-column prefix and same-width name column, so
-// their headline names align; from there each row type has its own columns.
-const NAME_W: usize = 15;
-const MOUNT_W: usize = 14;
+// The disk headline's model column (verbose mode only); NAME_W/MOUNT_W are the
+// shared tree columns and live in `format`.
 const MODEL_W: usize = 22;
 
 fn fg(color: Color) -> Style {
     Style::default().fg(color)
-}
-
-/// Truncate (with an ellipsis) or right-pad `s` to exactly `w` display columns.
-fn fit(s: &str, w: usize) -> String {
-    let n = s.chars().count();
-    if n == w {
-        s.to_string()
-    } else if n < w {
-        format!("{s}{}", " ".repeat(w - n))
-    } else {
-        let kept: String = s.chars().take(w.saturating_sub(1)).collect();
-        format!("{kept}…")
-    }
 }
 
 /// Sum the used bytes across a disk's mounted filesystems. Returns the total
@@ -371,10 +378,11 @@ fn disk_line(app: &App, dev: &Dev, marker: &str, verbose: bool) -> Line<'static>
         Some(t) => (format!("{t:.0}°C"), format::temp_color(t)),
         None => (String::new(), MUTED),
     };
+    let (disk_label, disk_kind) = app.disk_name(dev);
     let mut spans = vec![
         Span::styled(marker.to_string(), fg(MUTED)),
         Span::styled(format!("{} ", format::medium_glyph(dev.medium())), fg(ACCENT)),
-        Span::styled(fit(&app.disk_display(dev), NAME_W), Style::default().fg(HEADER).add_modifier(Modifier::BOLD)),
+        Span::styled(fit(&disk_label, NAME_W), Style::default().fg(name_color(disk_kind)).add_modifier(Modifier::BOLD)),
     ];
     if verbose {
         spans.push(Span::raw(" "));
@@ -438,11 +446,10 @@ fn part_line(app: &App, dev: &Dev, depth: usize, verbose: bool) -> Line<'static>
         spans.push(Span::styled("○ ", fg(MUTED)));
     }
 
-    // Headline: a real name (nickname/label) is bright; a device-id fallback is
-    // dimmed so labels read as more important.
-    let (label, named) = app.partition_label(dev);
-    let name_style = if named { fg(HEADER) } else { fg(MUTED) };
-    spans.push(Span::styled(fit(&label, name_w), name_style));
+    // Headline, colored by kind: a nickname is mauve, a filesystem label is
+    // bright, a device-id fallback is dimmed so labels read as more important.
+    let (label, kind) = app.partition_label(dev);
+    spans.push(Span::styled(fit(&label, name_w), fg(name_color(kind))));
     spans.push(Span::raw(" "));
 
     match dev.primary_mount() {
@@ -556,12 +563,13 @@ fn detail_disk(dev: &Dev) -> Text<'static> {
 }
 
 fn detail_part(app: &App, dev: &Dev) -> Text<'static> {
-    let (label, _) = app.partition_label(dev);
-    // Headline, then a line spelling out what that headline actually is (a
-    // nickname, a filesystem label, or just the device name).
+    let (label, kind) = app.partition_label(dev);
+    // Headline (colored by kind, matching the tree), then a line spelling out
+    // what that headline actually is (a nickname, a filesystem label, or just
+    // the device name).
     let mut lines = vec![
-        Line::from(Span::styled(label, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))),
-        Line::from(Span::styled(format!("({})", app.name_kind(dev)), Style::default().fg(MUTED))),
+        Line::from(Span::styled(label, Style::default().fg(name_color(kind)).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(format!("({})", kind.describe()), Style::default().fg(MUTED))),
     ];
     if dev.is_root() {
         lines.push(Line::from(Span::styled(

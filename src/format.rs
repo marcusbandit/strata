@@ -8,6 +8,19 @@
 use crate::model::Medium;
 use ratatui::style::Color;
 
+/// Shared palette so the TUI and the plain renderer read as one surface.
+pub const ACCENT: Color = Color::Rgb(0x8f, 0xbc, 0xbb); // teal
+pub const MUTED: Color = Color::Rgb(0x74, 0x78, 0x88);
+pub const HEADER: Color = Color::Rgb(0xd8, 0xde, 0xe9);
+/// A user-chosen nickname, colored distinctly from an on-disk filesystem label
+/// (`HEADER`) so the two kinds of name read apart at a glance.
+pub const NICK: Color = Color::Rgb(0xb4, 0x8e, 0xad); // soft mauve
+
+/// Fixed tree-column widths shared by the interactive tree and the plain
+/// overview, so disk and partition rows line up into the same scannable grid.
+pub const NAME_W: usize = 15;
+pub const MOUNT_W: usize = 14;
+
 /// Format a byte count the way `df -h` does: 1024-based, single-letter suffix,
 /// one decimal only when the value is small enough to need it.
 ///
@@ -29,6 +42,19 @@ pub fn human_bytes(bytes: u64) -> String {
         format!("{value:.1}{}", UNITS[unit])
     } else {
         format!("{value:.0}{}", UNITS[unit])
+    }
+}
+
+/// Truncate (with an ellipsis) or right-pad `s` to exactly `w` display columns.
+pub fn fit(s: &str, w: usize) -> String {
+    let n = s.chars().count();
+    if n == w {
+        s.to_string()
+    } else if n < w {
+        format!("{s}{}", " ".repeat(w - n))
+    } else {
+        let kept: String = s.chars().take(w.saturating_sub(1)).collect();
+        format!("{kept}…")
     }
 }
 

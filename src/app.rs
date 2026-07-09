@@ -6,7 +6,7 @@
 //! the system is done once in [`App::load`]; from then on the app just navigates
 //! and edits an in-memory snapshot.
 
-use crate::model::{Dev, Snapshot};
+use crate::model::{Dev, Health, Snapshot};
 use crate::naming::{self, Config};
 use crate::probe;
 use crate::probe::mounts::MountInfo;
@@ -78,6 +78,36 @@ pub struct DrillState {
     pub error: Option<String>,
 }
 
+/// Which kind of name a device's headline is. Drives the color it renders in
+/// (and the text tag in agent mode): a user-chosen nickname, an on-disk
+/// filesystem label, or a bare device-id fallback when neither is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameKind {
+    Nickname,
+    Label,
+    DeviceId,
+}
+
+impl NameKind {
+    /// A short, machine-friendly tag for the plain/agent output (`nick`, etc.).
+    pub fn tag(self) -> &'static str {
+        match self {
+            NameKind::Nickname => "nick",
+            NameKind::Label => "label",
+            NameKind::DeviceId => "dev",
+        }
+    }
+
+    /// A human phrase for the detail panel ("your nickname", etc.).
+    pub fn describe(self) -> &'static str {
+        match self {
+            NameKind::Nickname => "your nickname",
+            NameKind::Label => "filesystem label",
+            NameKind::DeviceId => "device name (no label set)",
+        }
+    }
+}
+
 pub struct App {
     pub snapshot: Snapshot,
     pub config: Config,
@@ -138,6 +168,90 @@ impl App {
             }
             Err(e) => self.status = Some(format!("refresh failed: {e}")),
         }
+    }
+
+    /// A lightweight refresh for the live event loop. Re-reads only the fast,
+    /// volatile facts (usage via lsblk, temperatures via sysfs) and updates in
+    /// place, silently, without disturbing selection, collapse state, or status.
+    ///
+    /// SMART health is *not* re-read here: `smartctl` shells out per disk and is
+    /// far too heavy to run every tick, and health changes rarely, so the prior
+    /// verdict is carried forward (a manual `R` still does a full re-probe).
+    pub fn live_refresh(&mut self) {
+        let Ok(mut drives) = probe::lsblk::collect() else {
+            return;
+        };
+        probe::health::enrich_temps(&mut drives);
+        // Carry each disk's last-known SMART verdict forward by kernel name.
+        let prev: HashMap<String, Health> = self
+            .snapshot
+            .drives
+            .iter()
+            .filter_map(|d| d.health.clone().map(|h| (d.name.clone(), h)))
+            .collect();
+        for d in &mut drives {
+            if let Some(h) = prev.get(&d.name) {
+                d.health = Some(h.clone());
+            }
+        }
+        let keep_name = self.selected_row().map(|r| r.name.clone());
+        self.snapshot = Snapshot { drives };
+        self.mounts = probe::mounts::collect();
+        self.rebuild_rows();
+        if let Some(name) = keep_name {
+            if let Some(i) = self.rows.iter().position(|r| r.name == name) {
+                self.selected = i;
+            }
+        }
+    }
+
+    /// Find a device anywhere in the tree matching a user-typed `selector`: its
+    /// kernel name (`sda1`), device path (`/dev/sda1`), a mountpoint
+    /// (`/mnt/games`), its filesystem label, or an existing nickname. Matching is
+    /// case-insensitive and the first hit (depth-first) wins.
+    pub fn find_dev(&self, selector: &str) -> Option<&Dev> {
+        self.snapshot.drives.iter().find_map(|d| self.find_in(d, selector))
+    }
+
+    fn find_in<'a>(&self, d: &'a Dev, sel: &str) -> Option<&'a Dev> {
+        if self.dev_matches(d, sel) {
+            return Some(d);
+        }
+        d.children.iter().find_map(|c| self.find_in(c, sel))
+    }
+
+    fn dev_matches(&self, d: &Dev, sel: &str) -> bool {
+        let eq = |s: &str| s.eq_ignore_ascii_case(sel);
+        eq(&d.name)
+            || eq(&d.path)
+            || eq(&format!("/dev/{}", d.name))
+            || d.mountpoints.iter().any(|m| eq(m))
+            || d.label.as_deref().is_some_and(eq)
+            || self.nickname(d).as_deref().is_some_and(eq)
+    }
+
+    /// Set (or, with `None`/empty, clear) the nickname of the device matching
+    /// `selector`, persisting the change to the config. Returns a human-readable
+    /// confirmation on success, or an explanatory error. Used by the CLI so a
+    /// nickname can be attached without entering the TUI.
+    pub fn set_nickname(&mut self, selector: &str, nickname: Option<&str>) -> Result<String, String> {
+        let dev = self
+            .find_dev(selector)
+            .cloned()
+            .ok_or_else(|| format!("no disk or partition matches \"{selector}\""))?;
+        let key = Self::alias_key(&dev).ok_or_else(|| {
+            format!("\"{}\" has no stable id (UUID or serial) to attach a nickname to", dev.name)
+        })?;
+        let clean = nickname.map(str::trim).filter(|s| !s.is_empty());
+        let mut alias = self.config.alias(&key).cloned().unwrap_or_default();
+        alias.nickname = clean.map(str::to_string);
+        self.config.set(&key, alias);
+        naming::save(&self.config).map_err(|e| format!("failed to save config: {e}"))?;
+        let loc = dev.primary_mount().map(|m| format!(" ({m})")).unwrap_or_default();
+        Ok(match clean {
+            Some(n) => format!("{}{} nickname set to \"{}\"", dev.name, loc, n),
+            None => format!("{}{} nickname cleared", dev.name, loc),
+        })
     }
 
     /// Flatten the drive tree into visible [`Row`]s, honoring `collapsed`.
@@ -236,39 +350,31 @@ impl App {
         Self::alias_key(dev).and_then(|k| self.config.alias(&k)).and_then(|a| a.nickname.clone())
     }
 
-    /// The human name of a filesystem and whether it is a *real* name (a
-    /// nickname or filesystem label) as opposed to a bare device-id fallback.
-    /// The bool lets the UI dim the fallback so a label reads as more important.
-    pub fn partition_label(&self, dev: &Dev) -> (String, bool) {
+    /// The human name of a filesystem and which *kind* of name it is (a user
+    /// nickname, an on-disk filesystem label, or a bare device-id fallback). The
+    /// kind lets the UI color the three apart and the plain output tag them.
+    pub fn partition_label(&self, dev: &Dev) -> (String, NameKind) {
         if let Some(nick) = self.nickname(dev) {
-            return (nick, true);
+            return (nick, NameKind::Nickname);
         }
         if let Some(label) = &dev.label {
-            return (label.clone(), true);
+            return (label.clone(), NameKind::Label);
         }
-        (dev.name.clone(), false)
+        (dev.name.clone(), NameKind::DeviceId)
     }
 
-    /// A disk's headline: the user's nickname if set, else the device name.
-    pub fn disk_display(&self, dev: &Dev) -> String {
-        self.nickname(dev).unwrap_or_else(|| dev.name.clone())
+    /// A disk's headline and its kind: the user's nickname if set, else the
+    /// device name. (Whole disks carry no filesystem label of their own.)
+    pub fn disk_name(&self, dev: &Dev) -> (String, NameKind) {
+        match self.nickname(dev) {
+            Some(nick) => (nick, NameKind::Nickname),
+            None => (dev.name.clone(), NameKind::DeviceId),
+        }
     }
 
     /// Whether this disk holds the system root `/` (anywhere in its subtree).
     pub fn disk_is_system(dev: &Dev) -> bool {
         dev.is_root() || dev.children.iter().any(Self::disk_is_system)
-    }
-
-    /// What kind of name `partition_label` returned, for the detail panel to
-    /// spell out ("this is a filesystem label", etc.).
-    pub fn name_kind(&self, dev: &Dev) -> &'static str {
-        if self.nickname(dev).is_some() {
-            "your nickname"
-        } else if dev.label.is_some() {
-            "filesystem label"
-        } else {
-            "device name (no label set)"
-        }
     }
 
     /// The name to show for a device: the user's nickname if set, else the real

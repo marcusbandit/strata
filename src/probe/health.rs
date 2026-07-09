@@ -20,11 +20,28 @@ use std::process::Command;
 /// nodes are left as-is (temperature and health are properties of the whole
 /// physical medium, not of a slice of it).
 pub fn enrich(drives: &mut [Dev]) {
+    enrich_temps(drives);
+    enrich_health(drives);
+}
+
+/// Fill in only `temp_c` for every physical disk. Cheap (sysfs reads), so this
+/// is the part the live TUI refresh runs on every tick.
+pub fn enrich_temps(drives: &mut [Dev]) {
     for d in drives.iter_mut() {
         if d.kind != "disk" {
             continue;
         }
         d.temp_c = read_temp(d);
+    }
+}
+
+/// Fill in only `health` for every physical disk. Shells out to `smartctl` once
+/// per disk, so this is kept off the live refresh path (see [`crate::app::App::live_refresh`]).
+pub fn enrich_health(drives: &mut [Dev]) {
+    for d in drives.iter_mut() {
+        if d.kind != "disk" {
+            continue;
+        }
         d.health = Some(read_smart_health(&d.path));
     }
 }
