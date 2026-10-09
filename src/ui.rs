@@ -609,7 +609,8 @@ fn part_line(app: &App, dev: &Dev, depth: usize, verbose: bool) -> Line<'static>
     let name_w = NAME_W.saturating_sub(extra);
 
     let mut spans = vec![Span::raw(" ".repeat(2 + extra))];
-    if dev.is_mounted() {
+    let via_child = dev.child_mount_label();
+    if dev.is_mounted() || via_child.is_some() {
         let color = dev.used_fraction().map(format::usage_color).unwrap_or(ACCENT);
         spans.push(Span::styled("● ", fg(color)));
     } else {
@@ -628,7 +629,10 @@ fn part_line(app: &App, dev: &Dev, depth: usize, verbose: bool) -> Line<'static>
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
         Some(mp) => spans.push(Span::styled(fit(mp, MOUNT_W), fg(HEADER))),
-        None => spans.push(Span::styled(fit("unmounted", MOUNT_W), fg(MUTED))),
+        None => match &via_child {
+            Some(t) => spans.push(Span::styled(fit(t, MOUNT_W), fg(MUTED))),
+            None => spans.push(Span::styled(fit("unmounted", MOUNT_W), fg(MUTED))),
+        },
     }
     spans.push(Span::raw(" "));
 

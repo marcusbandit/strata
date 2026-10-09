@@ -158,7 +158,8 @@ fn part_lines(app: &App, opts: &Opts, dev: &Dev, depth: usize, out: &mut String)
         out.push_str(&kind_cell(Some(kind)));
     }
     out.push_str(&" ".repeat(2 + extra));
-    if dev.is_mounted() {
+    let via_child = dev.child_mount_label();
+    if dev.is_mounted() || via_child.is_some() {
         let c = dev.used_fraction().map(format::usage_color).unwrap_or(ACCENT);
         out.push_str(&paint(opts, "● ", c, false));
     } else {
@@ -170,7 +171,10 @@ fn part_lines(app: &App, opts: &Opts, dev: &Dev, depth: usize, out: &mut String)
     match dev.primary_mount() {
         Some("/") => out.push_str(&paint(opts, &fit("\u{f015} / root", MOUNT_W), ACCENT, true)),
         Some(mp) => out.push_str(&paint(opts, &fit(mp, MOUNT_W), HEADER, false)),
-        None => out.push_str(&paint(opts, &fit("unmounted", MOUNT_W), MUTED, false)),
+        None => match &via_child {
+            Some(t) => out.push_str(&paint(opts, &fit(t, MOUNT_W), MUTED, false)),
+            None => out.push_str(&paint(opts, &fit("unmounted", MOUNT_W), MUTED, false)),
+        },
     }
     out.push(' ');
 

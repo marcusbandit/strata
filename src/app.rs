@@ -1073,6 +1073,33 @@ mod tests {
     }
 
     #[test]
+    fn lvm_pv_says_where_its_space_lives() {
+        let mut lv = part("ArchinstallVg-root", None);
+        lv.mountpoints = vec!["/var/log".to_string(), "/".to_string()];
+        let mut pv = part("nvme0n1p2", None);
+        pv.fstype = Some("LVM2_member".to_string());
+        pv.children = vec![lv];
+        assert!(!pv.is_mounted());
+        assert_eq!(pv.child_mount_label().as_deref(), Some("lvm: /"));
+    }
+
+    #[test]
+    fn luks_container_reports_the_opened_volume() {
+        let mut opened = part("luks-root", None);
+        opened.mountpoints = vec!["/".to_string()];
+        let mut container = part("nvme0n1p2", None);
+        container.fstype = Some("crypto_LUKS".to_string());
+        container.children = vec![opened];
+        assert_eq!(container.child_mount_label().as_deref(), Some("luks: /"));
+    }
+
+    #[test]
+    fn unmounted_childless_stays_unmounted() {
+        let p = part("sda1", None);
+        assert_eq!(p.child_mount_label(), None);
+    }
+
+    #[test]
     fn sort_by_size_reorders_but_paths_still_resolve() {
         let sized = |name: &str, size: u64| Dev {
             name: name.to_string(),

@@ -90,6 +90,42 @@ impl Dev {
         !self.mountpoints.is_empty()
     }
 
+    /// Mountpoints carried by this device's children when the device itself has
+    /// none: an LVM PV or a LUKS container is unmounted by its own account while
+    /// the volume it hosts carries the system's mounts.
+    pub fn child_mounts(&self) -> Vec<&str> {
+        let mut out = Vec::new();
+        for c in &self.children {
+            if c.is_mounted() {
+                out.push(c.primary_mount().unwrap_or("/"));
+            }
+            out.extend(c.child_mounts());
+        }
+        out.sort_unstable_by_key(|m| m.len());
+        out.dedup();
+        out
+    }
+
+    /// What the mount column shows for such a container: the transport kind
+    /// read off its own fstype, then where its space actually lives. `None`
+    /// for anything that is genuinely just unmounted.
+    pub fn child_mount_label(&self) -> Option<String> {
+        if self.is_mounted() || self.children.is_empty() {
+            return None;
+        }
+        let mounts = self.child_mounts();
+        if mounts.is_empty() {
+            return None;
+        }
+        let kind = match self.fstype.as_deref() {
+            Some("LVM2_member") => "lvm",
+            Some("crypto_LUKS") => "luks",
+            Some("linux_raid_member") => "raid",
+            _ => "child",
+        };
+        Some(format!("{kind}: {}", mounts.join(", ")))
+    }
+
     /// Fraction used in `0.0..=1.0`, if we know both size and used.
     pub fn used_fraction(&self) -> Option<f64> {
         match (self.fsused, self.fssize) {
